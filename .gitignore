@@ -3,4 +3,6 @@ target-patches/applied
 dl
 dist
 cache/
+.verify-eve/
+__pycache__/
 STRATEGIC.md

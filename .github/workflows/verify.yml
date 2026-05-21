@@ -1,0 +1,59 @@
+name: verify
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout olg-eve
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install pyyaml
+
+      - name: Configure git identity (needed for git am)
+        run: |
+          git config --global user.email "ci@olg-eve.local"
+          git config --global user.name "olg-eve CI"
+
+      - name: Run tools/verify.sh
+        run: ./tools/verify.sh
+
+      - name: Validate commit messages on new patches
+        if: github.event_name == 'pull_request'
+        run: |
+          # For each .patch file added or modified in this PR, extract its
+          # Subject header and pass it through tools/check-commit-msg.sh.
+          set -e
+          changed=$(git diff --name-only --diff-filter=AM "${{ github.event.pull_request.base.sha }}"..HEAD -- 'patches/*.patch' || true)
+          if [ -z "$changed" ]; then
+            echo "no patch files changed"; exit 0
+          fi
+          for p in $changed; do
+            subj=$(awk '
+              /^Subject:/ { sub(/^Subject:[[:space:]]*/, ""); buf=$0; in_s=1; next }
+              in_s && /^[[:space:]]/ { sub(/^[[:space:]]+/, " "); buf=buf $0; next }
+              in_s { exit }
+              END { sub(/^\[PATCH[^]]*\][[:space:]]*/, "", buf); print buf }
+            ' "$p")
+            tmp="$(mktemp -p . _msg.XXXX)"
+            printf "%s\n" "$subj" > "$tmp"
+            if ! ./tools/check-commit-msg.sh "$tmp"; then
+              echo "::error file=$p::commit-msg convention violated"
+              rm -f "$tmp"
+              exit 1
+            fi
+            rm -f "$tmp"
+          done

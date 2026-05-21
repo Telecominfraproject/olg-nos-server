@@ -149,7 +149,7 @@ setup = False
 update = False
 rebase = False
 config = "config.yml"
-eve = "eve"
+eve = None  # final value: -d > config.yml output_dir > default "eve"
 git_ref = ""
 
 try:
@@ -180,8 +180,9 @@ if not Path(config).is_file():
 	sys.exit(1)
 config = yaml.safe_load(open(config))
 
-if "output_dir" in config:
-	eve = config["output_dir"]
+# precedence: -d/--directory CLI flag > config.yml output_dir > default "eve"
+if eve is None:
+	eve = config.get("output_dir", "eve")
 
 if setup:
 	clone_tree()
