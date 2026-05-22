@@ -26,12 +26,31 @@ Use `./build.sh <profile>`, or follow the manual steps below:
 ./setup.py --setup    # for subsequent builds, use --rebase instead
 ```
 
-2. Build the installer for a profile (e.g. `ms-01`):
+2. Build the image for a profile (e.g. `ms-01`):
 ```shell
 cd eve
 make pkg/pillar
 make pkg/lps
 make HV=kvm ROOTFS_VERSION=snapshot LPS_PROFILE=ms-01 installer
+```
+
+`build.sh` picks the right image kind per target:
+
+| Target | Image kind | Output |
+|---|---|---|
+| `qemu` | `live`       | `eve/dist/amd64/snapshot/live.{img,qcow2,raw}` |
+| other  | `installer`  | `eve/dist/amd64/snapshot/installer.raw`         |
+
+The `qemu` profile uses `live` because it's meant to boot under QEMU
+directly without going through the installer flow.
+
+### Running under QEMU
+
+After `./build.sh qemu`, boot the live image with eve's built-in run target:
+
+```shell
+cd eve
+make run-live          # boots dist/amd64/snapshot/live.img under qemu
 ```
 
 ### Dockerized build

@@ -94,19 +94,25 @@ else
 	python3 setup.py --rebase
 fi
 
+# Image type: qemu profile boots as a live image; other targets get installers
+case "${TARGET}" in
+    qemu) IMAGE_TARGET=live ;;
+    *)    IMAGE_TARGET=installer ;;
+esac
+
 echo
 if [ $setup_only -eq 1 ] ; then
     echo "Build environment setup: ${BUILD_DIR}"
     echo "To compile run inside ${BUILD_DIR}:"
     echo "  make pkg/pillar"
     echo "  make pkg/lps"
-    echo "  make HV=kvm ROOTFS_VERSION=snapshot LPS_PROFILE=${TARGET} installer"
+    echo "  make HV=kvm ROOTFS_VERSION=snapshot LPS_PROFILE=${TARGET} ${IMAGE_TARGET}"
 else
-    echo "#################### Building $build_version for $TARGET ####################"
+    echo "#################### Building $build_version for $TARGET (${IMAGE_TARGET}) ####################"
 
     cd $BUILD_DIR
     make pkg/pillar
     make pkg/lps
-    make HV=kvm ROOTFS_VERSION=snapshot LPS_PROFILE=${TARGET} installer
+    make HV=kvm ROOTFS_VERSION=snapshot LPS_PROFILE=${TARGET} ${IMAGE_TARGET}
     cd -
 fi
