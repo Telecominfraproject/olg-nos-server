@@ -1,0 +1,29 @@
+# Pin for vyos-build upstream
+repo: https://github.com/vyos/vyos-build.git
+branch: current
+# Specific revision (commit SHA) to pin to — fill in once chosen.
+# Leave blank to track the branch tip (not recommended for reproducible builds).
+revision:
+
+# Docker image that runs the build. The vyos-build wiki publishes images
+# tagged per branch (current, sagitta, equuleus, ...). Match the branch above.
+docker_image: vyos/vyos-build:current
+
+# Command executed inside the container to produce the image. The default
+# uses the `qcow2-cloudinit` flavor introduced by the patch in
+# services/vyos/patches/. Adjust if you swap flavors / drop the patch.
+#
+# `sudo` runs inside the container (passwordless for the entrypoint-mapped
+# vyos_bld user) to elevate for chroot/loop-mount/debootstrap work. No
+# sudo is needed on the host running ./build-vyos.sh.
+build_cmd: |
+  sudo ./build-vyos-image qcow2-cloudinit
+
+# Glob (relative to the vyos-build/ checkout) used to locate the build output.
+# Most vyos-build flows write artifacts under build/.
+output_glob: build/*.qcow2
+
+# Filename the artifact gets renamed to in services/vyos/output/ and (with
+# --install) under eve/pkg/lps/images/. Must match what the relevant EVE
+# profile expects — see profiles/qemu.yml image.url basename.
+output_name: small-vyos-ssh-nat.qcow2

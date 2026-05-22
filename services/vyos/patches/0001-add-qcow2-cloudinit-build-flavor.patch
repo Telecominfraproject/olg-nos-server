@@ -1,0 +1,91 @@
+diff --git a/data/build-flavors/qcow2-cloudinit.toml b/data/build-flavors/qcow2-cloudinit.toml
+new file mode 100644
+index 0000000..ae61d43
+--- /dev/null
++++ b/data/build-flavors/qcow2-cloudinit.toml
+@@ -0,0 +1,85 @@
++# =============================================================================
++# VyOS qcow2 image with cloud-init, VPP/DPDK/XDP, and useful admin tools
++# Target: QEMU/KVM (Proxmox, libvirt, etc.) with NoCloud seed.iso support
++# Branch: current (rolling)
++# Build:  sudo ./build-vyos-image qcow2-cloudinit
++# =============================================================================
++
++# --- Image format -----------------------------------------------------------
++# qcow2 is the native QEMU format. "-c" enables compression to reduce size.
++image_format = "qcow2"
++image_opts   = "-c"
++
++# Disk size in GiB. 20G gives room for logs, VPP hugepages, and image upgrades.
++disk_size = 50
++
++# =============================================================================
++# Packages
++# All names are standard Debian/VyOS APT package names.
++# VPP + DPDK + XDP are already part of vyos-1x (rolling/current branch) and
++# do NOT need to be listed here — they are always included in the base image.
++# =============================================================================
++packages = [
++
++  # --- Cloud-init (required for seed.iso / NoCloud datasource) --------------
++  "cloud-init",
++  "cloud-utils",          # includes growpart for auto disk expansion on boot
++
++  # --- QEMU/KVM guest integration -------------------------------------------
++  "qemu-guest-agent",     # enables live snapshots, IP reporting in hypervisor
++
++  # --- Admin / debugging tools (requested) ----------------------------------
++  "screen",               # terminal multiplexer — useful over serial console
++  "vim",                  # editor
++  "htop",                 # interactive process viewer
++
++  # --- Networking diagnostics -----------------------------------------------
++  "tcpdump",              # packet capture (may already be present, safe to list)
++  "nmap",                 # network scanner / port checker
++  "iperf3",               # bandwidth testing — useful for VPP throughput checks
++  "ethtool",              # NIC info and tuning (queue count, offloads, etc.)
++  "lshw",                 # hardware info — useful for NIC/PCI identification
++
++  # --- VPP / DPDK / XDP helpers ---------------------------------------------
++  "linux-cpupower",       # set CPU governor to performance (required for VPP)
++  "numactl",              # NUMA topology awareness — VPP performance-critical
++  "pciutils",             # lspci — identify NIC PCI IDs for DPDK/vfio-pci
++  "usbutils",             # lsusb (minor, but handy on bare metal)
++  # vfio-pci is a kernel module shipped in linux-image-*, not an apt package;
++  # bind at runtime via `modprobe vfio-pci` + /etc/modules or kernel cmdline.
++
++  # --- System / performance -------------------------------------------------
++  "tuned",                # system tuning profiles (network-latency, throughput)
++  "sysstat",              # sar, iostat, mpstat for perf monitoring
++  "strace",               # syscall tracing for debugging
++  "lsof",                 # list open files / sockets
++
++  # --- Misc utilities -------------------------------------------------------
++  "tmux",                 # alternative terminal multiplexer to screen
++  "curl",                 # HTTP client (may already be present)
++  "jq",                   # JSON parsing — useful with VyOS HTTP API
++  "less",                 # pager
++  "dnsutils",             # dig, nslookup
++
++]
++
++# =============================================================================
++# Boot / console settings
++# ttyS0 @ 115200 is standard for KVM/QEMU serial console and Proxmox.
++# Also keeps KVM graphical console working (no console_type conflict).
++# =============================================================================
++[boot_settings]
++  timeout       = 5
++  console_type  = "ttyS"
++  console_num   = 0
++  console_speed = 115200
++
++# =============================================================================
++# Architecture-specific packages
++# hyperv-daemons is x86-only; keeping it here in case you ever need Hyper-V.
++# Remove this block if you only target KVM.
++# =============================================================================
++[architectures.amd64]
++  packages = [
++    "cpuid",              # CPU feature identification — useful for VPP/DPDK
++  ]

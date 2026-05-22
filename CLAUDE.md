@@ -61,11 +61,20 @@ the build silently produces an LPS package without VyOS. The QEMU live
 image still boots and EVE comes up, but `eve app list` will show VyOS
 in a launching loop (or just absent) because LPS has nothing to serve.
 
-Before any test that needs VyOS to actually start, drop the qcow2 into
-`eve/pkg/lps/images/` and confirm its sha256 matches what the relevant
-profile (`profiles/qemu.yml` etc.) declares — then rebuild
-`make pkg/lps` and the image target. A copy may already be cached
-on the dev box under `/home/vm/rebase/eve/pkg/lps/images/`.
+To get a valid qcow2 in place before `./build.sh qemu`:
+
+- **From scratch** — `./build-vyos.sh --install` clones the vyos-build
+  upstream pinned in `services/vyos/config.yml`, applies the patches in
+  `services/vyos/patches/`, runs the build in a `--privileged` Docker
+  container, and drops the resulting qcow2 into `eve/pkg/lps/images/`.
+  Then rebuild: `cd eve && make pkg/lps && cd .. && ./build.sh qemu`.
+- **From a pre-built copy** — drop the qcow2 directly under
+  `eve/pkg/lps/images/` and confirm its sha256 matches what
+  `profiles/qemu.yml` declares.
+
+The vyos-build pipeline lives entirely under `build-vyos.sh` (root) +
+`services/vyos/`. It's separate from the EVE build and the `vyos-build/`
+checkout is gitignored. See the script's `--help` for flags.
 
 ## The dev loop
 

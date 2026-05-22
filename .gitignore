@@ -6,4 +6,6 @@ cache/
 .verify-eve/
 __pycache__/
 .qemu-runs/
+vyos-build/
+services/vyos/output/
 STRATEGIC.md
