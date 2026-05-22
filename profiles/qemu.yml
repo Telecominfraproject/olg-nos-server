@@ -1,0 +1,50 @@
+# qemu.yml - Compile-time machine profile for QEMU testing
+# Used by gen-loc-config to generate conf/lps/loc-config.bin
+
+name: vyos
+
+image:
+  url: http://localhost:8888/images/small-vyos-ssh-nat.qcow2
+  sha256: 2a61b7368554a99bcfd8ad13c0e5c696f56a9c8645687b1d5fc29ac17897269a
+  format: qcow2
+  size: 744620032  # bytes
+
+vm:
+  memory_mb: 512
+  cpus: 1
+  vnc: true
+
+# LMP (Local Management Port): bridged to a Switch network instance.
+# VyOS gets a virtual NIC on this L2 bridge as its first interface (eth0).
+# In QEMU: eth1
+lmp: eth1
+
+# Additional interfaces passed to VyOS (all switch type for QEMU).
+# Interfaces are presented to VyOS in order: eth1, eth2, ...
+interfaces:
+  - name: eth0
+    type: switch
+
+vnc_passwd: "eve"
+
+ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKFz5k4h6F0KEKmxygyHTfNY+eJuHr3KenhWkZALxmyM vm@eveos-dev"
+
+output: conf/lps/loc-config.bin
+
+vyos:
+  wan: eth1
+  lmp_name: eth0
+  lan:
+    - eth0
+  lan_subnet: 192.168.1.0/24
+  lan_gateway: 192.168.1.1
+  dhcp_range_start: 192.168.1.100
+  dhcp_range_stop: 192.168.1.200
+  hostname: vyos-qemu
+  name_servers:
+    - 8.8.8.8
+    - 8.8.4.4
+  ci_output: conf/lps/vyos-ci.iso
+  commands:
+    - set service ssh port 22
+    - set system login user admin authentication plaintext-password 'yourpassword'

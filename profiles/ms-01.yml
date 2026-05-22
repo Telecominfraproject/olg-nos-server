@@ -1,0 +1,80 @@
+# ms-01.yml - Compile-time machine profile for MS-01 mini PC
+# Used by gen-loc-config to generate conf/lps/loc-config.bin
+#
+# Port layout (EVE host):
+#   eth0  10G  0000:02:00.0  group14  -> PCIe passthrough -> VyOS
+#   eth1  10G  0000:02:00.1  group15  -> PCIe passthrough -> VyOS
+#   eth2  2.5G 0000:57:00.0  group16  -> LMP (Switch NI bridge -> VyOS)
+#   eth3  2.5G 0000:58:00.0  group17  -> PCIe passthrough -> VyOS (WAN)
+#
+# Interface mapping inside VyOS (PCI enumeration order):
+#   eth0   -> VirtIO LMP NIC (lowest PCI addr 0x00:xx.0), renamed to eth100 via hw-id
+#   eth1   -> host eth3  (PCIe 2.5G WAN, PCI 0000:58:00.0) — first in interfaces list
+#   eth2   -> host eth0  (PCIe 10G LAN, PCI 0000:02:00.0)
+#   eth3   -> host eth1  (PCIe 10G LAN, PCI 0000:02:00.1)
+#   eth100 -> eth0 after udev rename via hw-id binding
+
+name: vyos
+
+image:
+  url: http://localhost:8888/images/small-vyos-ssh-nat.qcow2
+  sha256: 2a61b7368554a99bcfd8ad13c0e5c696f56a9c8645687b1d5fc29ac17897269a
+  format: qcow2
+  size: 744620032  # bytes
+
+vm:
+  memory_mb: 24576
+  cpus: 20
+  vnc: true
+
+# LMP (Local Management Port): bridged to a Switch network instance.
+# VyOS gets a virtual NIC on this L2 bridge as the last interface inside the VM.
+# eth2 = second 2.5G NIC, connected to management LAN.
+lmp: eth2
+
+# PCIe passthrough interfaces — presented to VyOS in order.
+# pci and assigngrp from controller-model.json (installer-generated).
+interfaces:
+  - name: eth3
+    type: pcie
+    pci: "0000:58:00.0"
+    assigngrp: "group17"
+  - name: eth0
+    type: pcie
+    pci: "0000:02:00.0"
+    assigngrp: "group14"
+  - name: eth1
+    type: pcie
+    pci: "0000:02:00.1"
+    assigngrp: "group15"
+
+vnc_passwd: "eve"
+
+ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKFz5k4h6F0KEKmxygyHTfNY+eJuHr3KenhWkZALxmyM vm@eveos-dev"
+
+output: conf/lps/loc-config.bin
+
+# VyOS cloud-init configuration.
+# wan/lan names refer to interfaces INSIDE the VM (see mapping at top of file).
+# gen-loc-config emits a hw-id binding only for eth100 (computed from app+NI UUIDs)
+# and deliberately deletes the hw-id of the WAN interface so that VyOS does not
+# MAC-lock eth0 to whatever NIC happened to be eth0 at cloud-init time, which
+# would conflict with the eth100 hw-id renaming of the VirtIO NIC.
+vyos:
+  lmp_name: eth0
+  wan: eth1
+  lan:
+    - eth2
+    - eth3
+    - eth0
+  lan_subnet: 192.168.1.0/24
+  lan_gateway: 192.168.1.1
+  dhcp_range_start: 192.168.1.100
+  dhcp_range_stop: 192.168.1.200
+  hostname: vyos-gw
+  name_servers:
+    - 8.8.8.8
+    - 8.8.4.4
+  ci_output: conf/lps/vyos-ci.iso
+  commands:
+    - set service ssh port 22
