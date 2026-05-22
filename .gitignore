@@ -5,4 +5,5 @@ dist
 cache/
 .verify-eve/
 __pycache__/
+.qemu-runs/
 STRATEGIC.md
