@@ -76,6 +76,35 @@ The vyos-build pipeline lives entirely under `build-vyos.sh` (root) +
 `services/vyos/`. It's separate from the EVE build and the `vyos-build/`
 checkout is gitignored. See the script's `--help` for flags.
 
+### Swapping the bundled VyOS qcow2
+
+Every rebuild of the VyOS image produces a different byte-for-byte
+artifact. LPS validates `image.sha256` and `image.size` in the profile
+against what it serves, so the profile and the bundled file must move
+together. The full round-trip when the qcow2 changes:
+
+```sh
+new=/path/to/new/small-vyos-ssh-nat.qcow2
+
+# 1. Compute and patch the profile in this repo
+sha=$(sha256sum "$new" | awk '{print $1}')
+size=$(stat -c%s "$new")
+sed -i -e "s|^  sha256: .*|  sha256: $sha|" \
+       -e "s|^  size:   .*|  size: $size  # bytes|" profiles/qemu.yml
+
+# 2. Stage into the LPS package (must match the path the patch declares)
+cp "$new" eve/pkg/lps/images/small-vyos-ssh-nat.qcow2
+
+# 3. Rebuild LPS, then the EVE image
+cd eve && make pkg/lps && cd ..
+./build.sh qemu
+```
+
+Skip any step and EVE either won't bundle the new image (step 2) or
+LPS will refuse to serve it (step 1, hash mismatch). The patches do
+**not** touch `profiles/qemu.yml` — it's editable repo content on
+`main` and symlinked into `eve/profiles` at setup time.
+
 ## The dev loop
 
 | Goal | Steps |
@@ -160,6 +189,13 @@ eve hv                  # hypervisor mode (kvm/xen)
 eve app console         # list available app consoles
 eve app console <id>    # attach to a guest VM's serial console (interactive)
 ```
+
+`eve app console <id>` shells out to **`tio`** (a serial-port terminal,
+not xenconsole). It insists on a real tty for stdin — non-interactive
+attaches fail with `Saving current stdin settings failed`. For scripts
+either allocate a pty (`ssh -tt … 'eve app console <id>'`) or scrape
+the dom serial from outside. Detach with **`Ctrl-t q`** (tio's escape;
+`Ctrl-]` won't work).
 
 Pubsub state for a guest VM (more detail than `eve app list`):
 
