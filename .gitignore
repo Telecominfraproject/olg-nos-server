@@ -1,0 +1,6 @@
+eve/
+target-patches/applied
+dl
+dist
+cache/
+STRATEGIC.md
