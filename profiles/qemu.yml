@@ -5,9 +5,9 @@ name: vyos
 
 image:
   url: http://localhost:8888/images/small-vyos-ssh-nat.qcow2
-  sha256: 2a61b7368554a99bcfd8ad13c0e5c696f56a9c8645687b1d5fc29ac17897269a
+  sha256: 8eadff0c026eeae26d3d0bcbbae523967af7edbe8f301bd6554a8cee347feafd
   format: qcow2
-  size: 744620032  # bytes
+  size: 805044224  # bytes
 
 vm:
   memory_mb: 512
