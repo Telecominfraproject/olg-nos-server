@@ -1,0 +1,108 @@
+From 04a56264d8cb8660f55fbdb6b15eeb867d874392 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 10 Mar 2026 11:17:56 +0000
+Subject: [PATCH] gen-loc-config: add support for
+ EnforceNetworkInterfaceOrder
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 50 ++++++++++++++++-----------
+ 1 file changed, 29 insertions(+), 21 deletions(-)
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index fdd536f52..3c5d09cc9 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -238,8 +238,9 @@ func main() {
+ 				log.Fatalf("interface %s: pcie type requires 'pci' and 'assigngrp' fields in profile", iface.Name)
+ 			}
+ 			pcieAdapters = append(pcieAdapters, &zconfig.Adapter{
+-				Type: evecommon.PhyIoType_PhyIoNetEth,
+-				Name: iface.Name,
++				Type:           evecommon.PhyIoType_PhyIoNetEth,
++				Name:           iface.Name,
++				InterfaceOrder: uint32(len(pcieAdapters) + 1),
+ 			})
+ 		default:
+ 			log.Fatalf("unknown interface type %q for %s (use 'switch' or 'pcie')", iface.Type, iface.Name)
+@@ -247,28 +248,34 @@ func main() {
+ 	}
+ 
+ 	// --- App interfaces (virtual NICs) ---
+-	// Order: NAT (if set) → switch interfaces → LMP (last)
++	// When PCIe adapters are present, EnforceNetworkInterfaceOrder is enabled so that
++	// PCIe network devices (InterfaceOrder 1..N) are placed before virtual NICs on the
++	// guest PCI bus, making them appear as lower ethN indices (WAN first).
++	// Virtual NICs continue numbering from N+1, with LMP always last.
+ 	var appInterfaces []*zconfig.NetworkAdapter
+-	vmEthIdx := 0
++	virtIntfOrder := uint32(len(pcieAdapters) + 1)
+ 
+ 	if *uplink != "" {
+ 		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+-			Name:      fmt.Sprintf("eth%d", vmEthIdx),
+-			NetworkId: natNIUUID,
++			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
++			NetworkId:      natNIUUID,
++			InterfaceOrder: virtIntfOrder,
+ 		})
+-		vmEthIdx++
++		virtIntfOrder++
+ 	}
+ 	for _, sni := range switchNIs {
+ 		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+-			Name:      fmt.Sprintf("eth%d", vmEthIdx),
+-			NetworkId: sni.niUUID,
++			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
++			NetworkId:      sni.niUUID,
++			InterfaceOrder: virtIntfOrder,
+ 		})
+-		vmEthIdx++
++		virtIntfOrder++
+ 	}
+ 	if lmp != "" {
+ 		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+-			Name:      fmt.Sprintf("eth%d", vmEthIdx),
+-			NetworkId: lmpNIUUID,
++			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
++			NetworkId:      lmpNIUUID,
++			InterfaceOrder: virtIntfOrder,
+ 			Acls: []*zconfig.ACE{
+ 				{
+ 					Name: "allow-all",
+@@ -281,7 +288,7 @@ func main() {
+ 				},
+ 			},
+ 		})
+-		vmEthIdx++
++		virtIntfOrder++
+ 	}
+ 
+ 	// DeviceIoList: tell EVE about PCIe-assignable adapters.
+@@ -381,14 +388,15 @@ func main() {
+ 				Uuidandversion: &zconfig.UUIDandVersion{Uuid: appUUID, Version: "1"},
+ 				Displayname:    *name,
+ 				Fixedresources: &zconfig.VmConfig{
+-					Memory:             uint32(*memoryMB * 1024),
+-					Maxmem:             uint32(*memoryMB * 1024),
+-					Vcpus:              uint32(*cpus),
+-					Maxcpus:            uint32(*cpus),
+-					VirtualizationMode: zconfig.VmMode_HVM,
+-					EnableVnc:          *enableVNC,
+-					VncDisplay:         1,
+-					VncPasswd:          *vncPasswd,
++					Memory:                       uint32(*memoryMB * 1024),
++					Maxmem:                       uint32(*memoryMB * 1024),
++					Vcpus:                        uint32(*cpus),
++					Maxcpus:                      uint32(*cpus),
++					VirtualizationMode:           zconfig.VmMode_HVM,
++					EnableVnc:                    *enableVNC,
++					VncDisplay:                   1,
++					VncPasswd:                    *vncPasswd,
++					EnforceNetworkInterfaceOrder: len(pcieAdapters) > 0,
+ 				},
+ 				VolumeRefList: []*zconfig.VolumeRef{
+ 					{Uuid: volUUID, GenerationCount: 0, MountDir: ""},
+-- 
+2.51.0
+

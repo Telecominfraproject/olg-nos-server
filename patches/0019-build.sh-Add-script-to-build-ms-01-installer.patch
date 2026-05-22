@@ -1,0 +1,25 @@
+From a30be4401b6b3940b9178ee34b16ae859d62ef30 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 18 Mar 2026 09:39:05 +0000
+Subject: [PATCH] build.sh: Add script to build ms-01 installer
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ build.sh | 5 +++++
+ 1 file changed, 5 insertions(+)
+ create mode 100755 build.sh
+
+diff --git a/build.sh b/build.sh
+new file mode 100755
+index 000000000..bb41de755
+--- /dev/null
++++ b/build.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++
++make pkg/pillar;
++make pkg/lps;
++make HV=kvm ROOTFS_VERSION=snapshot LPS_PROFILE=ms-01 installer;
+-- 
+2.51.0
+

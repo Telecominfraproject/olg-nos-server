@@ -1,0 +1,52 @@
+From 89d85ba56ccb5d039517a9c416f8485bb8c92d4b Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Fri, 6 Mar 2026 15:04:05 +0000
+Subject: [PATCH] wait: bypass controller onboarding when
+ /config/device-uuid is present
+
+All agents call WaitForOnboarded before doing any useful work. In airgap/dev
+deployments without a cloud controller, this blocks forever because zedclient
+never receives a UUID from the controller.
+
+Check /config/device-uuid first: if it contains a valid UUID, return a
+synthetic OnboardingStatus immediately. This unblocks all 14 affected agents
+(baseosmgr, zedmanager, volumemgr, downloader, domainmgr, etc.) with a single
+change, allowing the full LOC-based configuration flow to proceed.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/utils/wait/waitfor.go | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/pkg/pillar/utils/wait/waitfor.go b/pkg/pillar/utils/wait/waitfor.go
+index 83d5ba221..183e32a73 100644
+--- a/pkg/pillar/utils/wait/waitfor.go
++++ b/pkg/pillar/utils/wait/waitfor.go
+@@ -4,6 +4,8 @@
+ package wait
+ 
+ import (
++	"os"
++	"strings"
+ 	"time"
+ 
+ 	info "github.com/lf-edge/eve-api/go/info"
+@@ -84,6 +86,15 @@ func handleVaultStatusImpl(ctxArg interface{}, key string,
+ // WaitForOnboarded waits until it receives a types.OnboardingStatus msg with
+ // a non-zero UUID
+ func WaitForOnboarded(ps *pubsub.PubSub, log *base.LogObject, agentName string, warningTime, errorTime time.Duration) (types.OnboardingStatus, error) {
++	// For airgap/dev deployments without a cloud controller, a pre-provisioned
++	// UUID in /config/device-uuid bypasses controller onboarding for all agents.
++	if data, err := os.ReadFile("/config/device-uuid"); err == nil {
++		if u, err := uuid.FromString(strings.TrimSpace(string(data))); err == nil && u != nilUUID {
++			log.Noticef("WaitForOnboarded(%s): using pre-provisioned UUID from /config/device-uuid: %s", agentName, u)
++			return types.OnboardingStatus{DeviceUUID: u}, nil
++		}
++	}
++
+ 	// Look for vault status
+ 	Ctx := &Context{}
+ 	subOnboardStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+-- 
+2.51.0
+

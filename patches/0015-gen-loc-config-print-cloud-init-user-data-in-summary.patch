@@ -1,0 +1,49 @@
+From 0d9d01aca933c1f7a2870c1557aa2435bb49fcb2 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 11 Mar 2026 11:46:13 +0000
+Subject: [PATCH] gen-loc-config: print cloud-init user-data in summary
+
+Makes it easy to review the full VyOS cloud-init configuration that
+will be embedded in the generated loc-config.bin without having to
+decode the base64 UserData field from the proto manually.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index 6857e6be8..f27c0503a 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -456,6 +456,8 @@ func main() {
+ 		log.Printf("PCIe passthrough mode: NIM will manage only %s; PCIe adapters excluded from DevicePortConfig", lmp)
+ 	}
+ 
++	cloudInitUserData := generateVyOSUserData(vyosCfg)
++
+ 	cfg := &zconfig.EdgeDevConfig{
+ 		ConfigItems:       configItems,
+ 		DeviceIoList:      deviceIoList,
+@@ -513,7 +515,7 @@ func main() {
+ 				},
+ 				Interfaces: appInterfaces,
+ 				Adapters:   pcieAdapters,
+-				UserData:   base64.StdEncoding.EncodeToString([]byte(generateVyOSUserData(vyosCfg))),
++				UserData:   base64.StdEncoding.EncodeToString([]byte(cloudInitUserData)),
+ 				Activate:   true,
+ 			},
+ 		},
+@@ -561,6 +563,9 @@ func main() {
+ 	if *sshKey != "" {
+ 		fmt.Printf("  SSH key       : %s...\n", (*sshKey)[:40])
+ 	}
++	if cloudInitUserData != "" {
++		fmt.Printf("\nCloud-init user-data:\n%s\n", cloudInitUserData)
++	}
+ }
+ 
+ // lmpMACFromUUIDs computes a deterministic MAC address for the LMP virtual NIC.
+-- 
+2.51.0
+

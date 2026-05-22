@@ -1,0 +1,43 @@
+From f745f3b32a91133257ee0061f6c465fb38834425 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Fri, 6 Mar 2026 14:23:00 +0000
+Subject: [PATCH] zedagent: don't fatal on missing TLS certs in airgap
+ mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In airgap/dev deployments without a cloud controller, device certs
+(/config/device.cert.pem, root-certificate.pem) may not exist because
+tpmmgr hasn't run yet or there is no controller to onboard against.
+UpdateTLSConfig failing is expected in this scenario — downgrade from
+log.Fatal to log.Warningf so configTimerTask can proceed.
+
+Controller requests will still fail (expected, no controller), but LOC
+requests use plain HTTP and do not require a TLS config.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/zedagent/handleconfig.go | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/pillar/cmd/zedagent/handleconfig.go b/pkg/pillar/cmd/zedagent/handleconfig.go
+index 6c0f788ba..898a0c4db 100644
+--- a/pkg/pillar/cmd/zedagent/handleconfig.go
++++ b/pkg/pillar/cmd/zedagent/handleconfig.go
+@@ -387,7 +387,11 @@ func initZedcloudContext(getconfigCtx *getconfigContext,
+ 	// XXX need to redo this since the root certificates can change
+ 	err = ctrlClient.UpdateTLSConfig(nil)
+ 	if err != nil {
+-		log.Fatal(err)
++		// In airgap/dev mode the device certs and controller root CA may not
++		// exist (no cloud controller, no tpmmgr run yet). Log a warning and
++		// continue — controller TLS requests will fail (expected), but LOC
++		// requests use plain HTTP and do not require a TLS config.
++		log.Warningf("initGetConfig: TLS config unavailable (missing certs): %v", err)
+ 	}
+ 	return ctrlClient
+ }
+-- 
+2.51.0
+

@@ -1,0 +1,36 @@
+From 5485e458aed64dcef944fe845c76126a8cf4ea1a Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 11 Mar 2026 12:28:36 +0000
+Subject: [PATCH] downloader: skip mDNS for localhost/loopback datastores
+
+When the datastore URL points to localhost or a loopback address,
+connect directly using the loopback interface instead of attempting
+mDNS discovery (findDSmDNS), which cannot resolve "localhost".
+
+This complements the earlier change that bypassed the management-port
+cost check for local URLs; without this fix the download still failed
+with "findDSmDNS: mDNS host not found for localhost".
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/downloader/syncop.go | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/pkg/pillar/cmd/downloader/syncop.go b/pkg/pillar/cmd/downloader/syncop.go
+index 60c16ea17..4c3b82c46 100644
+--- a/pkg/pillar/cmd/downloader/syncop.go
++++ b/pkg/pillar/cmd/downloader/syncop.go
+@@ -244,6 +244,10 @@ func handleSyncOp(ctx *downloaderContext, key string,
+ 				continue
+ 			}
+ 			ifname = types.GetMgmtPortFromAddr(ctx.deviceNetworkStatus, ipSrc)
++		} else if isLocalServerURL(serverURL) {
++			// localhost/loopback: connect directly, no mDNS needed
++			ifname = "lo"
++			ipSrc = net.ParseIP("127.0.0.1")
+ 		} else {
+ 			serverURL, ifname, ipSrc, err = findDSmDNS(ctx, serverURL)
+ 			if err != nil {
+-- 
+2.51.0
+

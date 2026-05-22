@@ -1,0 +1,36 @@
+From 6205c231e7d3e7cc0caba57cfdabf619a727e668 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 10 Mar 2026 11:07:43 +0000
+Subject: [PATCH] gen-loc-config: add firewall rule to allow traffic on
+ lmp
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index aa2965bb8..fdd536f52 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -269,6 +269,17 @@ func main() {
+ 		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+ 			Name:      fmt.Sprintf("eth%d", vmEthIdx),
+ 			NetworkId: lmpNIUUID,
++			Acls: []*zconfig.ACE{
++				{
++					Name: "allow-all",
++					Id:   1,
++					Dir:  zconfig.ACEDirection_BOTH,
++					Matches: []*zconfig.ACEMatch{
++						{Type: "ip", Value: "0.0.0.0/0"},
++					},
++					Actions: []*zconfig.ACEAction{{Drop: false}},
++				},
++			},
+ 		})
+ 		vmEthIdx++
+ 	}
+-- 
+2.51.0
+

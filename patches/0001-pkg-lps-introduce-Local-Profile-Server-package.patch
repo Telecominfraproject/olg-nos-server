@@ -1,0 +1,998 @@
+From 51ff6d086b8b98e6d89dffb84ba6449a1f81ac2d Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 4 Mar 2026 16:01:12 +0000
+Subject: [PATCH] pkg/lps: introduce Local Profile Server package
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a new LinuxKit service package (pkg/lps) implementing the EVE LPS
+REST API (PROFILE.md). The server runs as a containerized microservice
+on port 8888 and provides:
+
+- GET  /api/v1/local_profile       — advertise a local profile override
+- POST /api/v1/radio               — acknowledge radio status, respond with silence config
+- POST /api/v1/appinfo             — respond with per-app restart/purge commands
+- POST /api/v1/devinfo             — respond with device commands (reboot/shutdown/collect_info)
+- POST /api/v1/location            — acknowledge GNSS location reports
+- POST /api/v2/edgedevice/.../compound-config — LOC endpoint serving loc-config.bin
+- GET  /images/*                   — static HTTP file server for disk images
+
+The server reads config from /config/lps/ (token, profile, radio_silence,
+dev_command, app_commands/) and writes state snapshots to /persist/lps/.
+Disk images placed in pkg/lps/images/ are bundled via git-lfs, seeded to
+/persist/lps/images/ on first boot by lps-init.sh (copy-once, idempotent),
+and served over HTTP to EVE's downloader for fully airgapped operation.
+
+zedagent changes:
+- Skip AuthContainer signature verification for http:// LOC URLs
+  (local-network trust model; no controller signing key in airgap/dev)
+- Bootstrap LOC URL from /config/loc/url when no controller-provisioned
+  LOC config is available, enabling airgap/dev deployments without
+  a cloud controller
+
+Also add /persist/lps/ to storage-init.sh and wire LPS_TAG into
+parse-pkgs.sh and images/rootfs.yml.in.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ .gitattributes                          |   1 +
+ conf/GlobalConfig/global.json           |  12 +
+ conf/loc/url                            |   1 +
+ conf/server                             |   2 +-
+ images/rootfs.yml.in                    |   4 +
+ pkg/lps/Dockerfile                      |  55 ++
+ pkg/lps/build.yml                       |  13 +
+ pkg/lps/go.mod                          |   7 +
+ pkg/lps/images/README                   |   1 +
+ pkg/lps/lps-init.sh                     |  31 ++
+ pkg/lps/src/main.go                     | 666 ++++++++++++++++++++++++
+ pkg/pillar/cmd/zedagent/handleconfig.go |  17 +-
+ pkg/storage-init/storage-init.sh        |   3 +
+ tools/parse-pkgs.sh                     |   2 +
+ 14 files changed, 813 insertions(+), 2 deletions(-)
+ create mode 100644 .gitattributes
+ create mode 100644 conf/GlobalConfig/global.json
+ create mode 100644 conf/loc/url
+ create mode 100644 pkg/lps/Dockerfile
+ create mode 100644 pkg/lps/build.yml
+ create mode 100644 pkg/lps/go.mod
+ create mode 100644 pkg/lps/images/README
+ create mode 100644 pkg/lps/lps-init.sh
+ create mode 100644 pkg/lps/src/main.go
+
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 000000000..8ab081052
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1 @@
++*.qcow2 filter=lfs diff=lfs merge=lfs -text
+diff --git a/conf/GlobalConfig/global.json b/conf/GlobalConfig/global.json
+new file mode 100644
+index 000000000..bab5544e8
+--- /dev/null
++++ b/conf/GlobalConfig/global.json
+@@ -0,0 +1,12 @@
++{
++  "GlobalSettings": {
++    "airgap.mode": {
++      "Key": "airgap.mode",
++      "ItemType": 4,
++      "IntValue": 0,
++      "StrValue": "",
++      "BoolValue": false,
++      "TriStateValue": 2
++    }
++  }
++}
+diff --git a/conf/loc/url b/conf/loc/url
+new file mode 100644
+index 000000000..cefa37125
+--- /dev/null
++++ b/conf/loc/url
+@@ -0,0 +1 @@
++http://localhost:8888
+diff --git a/conf/server b/conf/server
+index 7b32e7069..2fbb50c4a 100644
+--- a/conf/server
++++ b/conf/server
+@@ -1 +1 @@
+-zedcloud.alpha.zededa.net
++localhost
+diff --git a/images/rootfs.yml.in b/images/rootfs.yml.in
+index adbb3f3ef..0597b0992 100644
+--- a/images/rootfs.yml.in
++++ b/images/rootfs.yml.in
+@@ -58,6 +58,10 @@ services:
+     image: EDGEVIEW_TAG
+     cgroupsPath: /eve/services/eve-edgeview
+     oomScoreAdj: -800
++  - name: lps
++    image: LPS_TAG
++    cgroupsPath: /eve/services/lps
++    oomScoreAdj: -800
+   - name: debug
+     image: DEBUG_TAG
+     cgroupsPath: /eve/services/debug
+diff --git a/pkg/lps/Dockerfile b/pkg/lps/Dockerfile
+new file mode 100644
+index 000000000..d011c4cc0
+--- /dev/null
++++ b/pkg/lps/Dockerfile
+@@ -0,0 +1,55 @@
++
++# Build stage: compile the LPS server binary.
++# Uses the same eve-alpine base as all other EVE packages for consistency.
++FROM lfedge/eve-alpine:745ae9066273c73b0fd879c4ba4ff626a8392d04 AS build
++
++# Build-time packages (not included in the final image).
++ENV BUILD_PKGS git
++
++# Runtime packages installed into /out/ by eve-alpine-deploy.sh.
++ENV PKGS alpine-baselayout musl-utils
++
++RUN eve-alpine-deploy.sh
++
++# Copy Go module definition and source.
++COPY go.mod /lps/go.mod
++COPY src/    /lps/src/
++
++WORKDIR /lps/src
++
++# No external dependencies — pure stdlib build.
++ARG GOPKGVERSION
++ENV CGO_ENABLED=0
++
++# hadolint ignore=SC2046
++RUN echo "Running go vet" && go vet ./... \
++ && echo "Running go fmt check" \
++ && ERR=$(gofmt -e -l -s $(find . -name \*.go)) \
++ && if [ -n "$ERR" ]; then echo "go fmt failed: $ERR"; exit 1; fi \
++ && GO111MODULE=on CGO_ENABLED=0 go build \
++        -ldflags "-s -w -X=main.Version=${GOPKGVERSION}" \
++        -o /out/usr/bin/lps-server .
++
++COPY lps-init.sh /out/usr/bin/lps-init.sh
++RUN chmod +x /out/usr/bin/lps-init.sh
++
++# Bundle disk images so EVE can serve them from /persist/lps/images/ without
++# an external server.  lps-init.sh seeds /persist/lps/images/ from here on
++# first boot (copy-once, idempotent).
++COPY images/ /out/usr/share/lps/images/
++RUN chmod -R 644 /out/usr/share/lps/images/ && chmod 755 /out/usr/share/lps/images/
++
++# Final stage: minimal scratch image with only the binary.
++FROM scratch
++
++COPY --from=build /out/ /
++
++# Ensure /tmp exists (needed by some Go runtime operations).
++RUN mkdir -p /tmp && echo "hosts: files dns" > /etc/nsswitch.conf
++
++ENV PATH="/usr/bin:${PATH}"
++
++WORKDIR /
++
++ENTRYPOINT ["/usr/bin/lps-init.sh"]
++CMD []
+diff --git a/pkg/lps/build.yml b/pkg/lps/build.yml
+new file mode 100644
+index 000000000..097acaa70
+--- /dev/null
++++ b/pkg/lps/build.yml
+@@ -0,0 +1,13 @@
++image: eve-lps
++org: lfedge
++config:
++  # The LPS server needs access to:
++  # - /config/lps: read token, profile, radio_silence, dev_command, app_commands/
++  # - /persist/lps: write state files (last_location.json, etc.)
++  # - host network: LPS listens on port 8888 and EVE connects to it directly
++  binds:
++    - /config:/config:ro
++    - /persist/lps:/persist/lps
++  capabilities:
++    - CAP_NET_BIND_SERVICE  # bind to port 8888
++  net: host
+diff --git a/pkg/lps/go.mod b/pkg/lps/go.mod
+new file mode 100644
+index 000000000..2061ec819
+--- /dev/null
++++ b/pkg/lps/go.mod
+@@ -0,0 +1,7 @@
++
++// Module for the EVE LPS (Local Profile Server) example package.
++// Uses only the Go standard library — no external dependencies required.
++
++module github.com/lf-edge/eve/pkg/lps
++
++go 1.24
+diff --git a/pkg/lps/images/README b/pkg/lps/images/README
+new file mode 100644
+index 000000000..5a9e3cb5a
+--- /dev/null
++++ b/pkg/lps/images/README
+@@ -0,0 +1 @@
++Please put small-vyos-ssh-nat.qcow2 file in this directory
+diff --git a/pkg/lps/lps-init.sh b/pkg/lps/lps-init.sh
+new file mode 100644
+index 000000000..00f67732b
+--- /dev/null
++++ b/pkg/lps/lps-init.sh
+@@ -0,0 +1,31 @@
++#!/bin/sh
++#
++# LPS (Local Profile Server) container entrypoint.
++# Creates required directories and starts the LPS server binary.
++
++set -e
++
++CONFIG_DIR="${LPS_CONFIG_DIR:-/config/lps}"
++STATE_DIR="${LPS_STATE_DIR:-/persist/lps}"
++PORT="${LPS_PORT:-8888}"
++
++# Ensure state directory exists (config is read-only from the host).
++mkdir -p "${STATE_DIR}/images"
++
++# Seed /persist/lps/images/ from bundled images on first boot (copy-once).
++BUNDLED_DIR="/usr/share/lps/images"
++if [ -d "${BUNDLED_DIR}" ]; then
++    for src in "${BUNDLED_DIR}"/*; do
++        [ -f "${src}" ] || continue
++        dst="${STATE_DIR}/images/$(basename "${src}")"
++        if [ ! -f "${dst}" ]; then
++            echo "lps-init: seeding $(basename "${src}") to ${STATE_DIR}/images/"
++            cp "${src}" "${dst}"
++        fi
++    done
++fi
++
++exec /usr/bin/lps-server \
++    -port   "${PORT}" \
++    -config "${CONFIG_DIR}" \
++    -state  "${STATE_DIR}"
+diff --git a/pkg/lps/src/main.go b/pkg/lps/src/main.go
+new file mode 100644
+index 000000000..e3dbd068a
+--- /dev/null
++++ b/pkg/lps/src/main.go
+@@ -0,0 +1,666 @@
++// Package main implements a minimal Local Profile Server (LPS) for EVE OS.
++//
++// The LPS is an optional component that provides local device management
++// complementing the cloud controller. It implements the LPS REST API defined in:
++// https://github.com/lf-edge/eve-api/blob/main/PROFILE.md
++//
++// This implementation uses only the Go standard library. Proto-binary responses
++// are encoded using raw proto wire format (field tags + varints) without
++// importing google.golang.org/protobuf or eve-api modules.
++//
++// # Configuration (files read from -config directory, default /config/lps):
++//
++//   - token         — LPS authentication token (plain text, must match
++//     profile_server_token provisioned by controller to EVE)
++//   - profile       — local profile name to advertise (plain text; if absent
++//     or empty, /api/v1/local_profile returns HTTP 204)
++//   - radio_silence — "1" to enable radio silence, "0" or absent to disable
++//   - dev_command   — JSON file with device command: {"command":"reboot|shutdown|poweroff|collect_info","timestamp":1234567890}
++//   - app_commands/ — directory; one JSON file per app UUID:
++//     {"command":"restart|purge","timestamp":1234567890}
++//
++// # State (files written to -state directory, default /persist/lps):
++//
++//   - last_location.json — metadata of last received location POST
++//   - last_radio.json    — metadata of last received radio POST
++//   - last_appinfo.json  — metadata of last received appinfo POST
++//   - last_devinfo.json  — metadata of last received devinfo POST
++//
++// # Usage:
++//
++//	lps-server [-port 8888] [-config /config/lps] [-state /persist/lps]
++//
++// Environment variables LPS_PORT, LPS_CONFIG_DIR, LPS_STATE_DIR override flags.
++package main
++
++import (
++	"encoding/binary"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"io"
++	"log"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++const (
++	contentTypeProto = "application/x-proto-binary"
++	maxBodyBytes     = 1 << 20 // 1 MiB — reasonable limit for LPS request bodies
++
++	// Proto wire types
++	wireVarint   = 0
++	wireLenDelim = 2
++
++	// LocalDevCmd.Command enum values (from eve-api/proto/profile/local_profile.proto)
++	devCmdShutdown         = 1
++	devCmdShutdownPoweroff = 2
++	devCmdGracefulReboot   = 3
++	devCmdCollectInfo      = 4
++
++	// AppCommand.Command enum values
++	appCmdRestart = 1
++	appCmdPurge   = 2
++)
++
++// server is the LPS HTTP server.
++type server struct {
++	configDir string
++	stateDir  string
++}
++
++// ---- Proto wire format helpers (stdlib, no external deps) -------------------
++
++// encodeVarint encodes a uint64 as a proto varint (7-bit groups, LSB first,
++// MSB=1 means more bytes follow).
++func encodeVarint(v uint64) []byte {
++	var buf [10]byte
++	n := binary.PutUvarint(buf[:], v)
++	return buf[:n]
++}
++
++// encodeTag returns the proto field tag byte(s) for the given field number and wire type.
++func encodeTag(fieldNum, wireType uint64) []byte {
++	return encodeVarint((fieldNum << 3) | wireType)
++}
++
++// encodeString returns the proto encoding of a length-delimited string field.
++func encodeString(fieldNum uint64, s string) []byte {
++	tag := encodeTag(fieldNum, wireLenDelim)
++	length := encodeVarint(uint64(len(s)))
++	out := make([]byte, 0, len(tag)+len(length)+len(s))
++	out = append(out, tag...)
++	out = append(out, length...)
++	out = append(out, s...)
++	return out
++}
++
++// encodeBytes returns the proto encoding of a length-delimited bytes field.
++func encodeBytes(fieldNum uint64, b []byte) []byte {
++	tag := encodeTag(fieldNum, wireLenDelim)
++	length := encodeVarint(uint64(len(b)))
++	out := make([]byte, 0, len(tag)+len(length)+len(b))
++	out = append(out, tag...)
++	out = append(out, length...)
++	out = append(out, b...)
++	return out
++}
++
++// encodeBool returns the proto encoding of a varint bool field.
++func encodeBool(fieldNum uint64, b bool) []byte {
++	tag := encodeTag(fieldNum, wireVarint)
++	if b {
++		return append(tag, 0x01)
++	}
++	return append(tag, 0x00)
++}
++
++// encodeUint64 returns the proto encoding of a varint uint64 field.
++func encodeUint64(fieldNum uint64, v uint64) []byte {
++	return append(encodeTag(fieldNum, wireVarint), encodeVarint(v)...)
++}
++
++// encodeEnum returns the proto encoding of a varint enum field.
++func encodeEnum(fieldNum uint64, v int) []byte {
++	return encodeUint64(fieldNum, uint64(v))
++}
++
++// encodeEmbedded wraps an already-encoded message as an embedded (length-delimited) field.
++func encodeEmbedded(fieldNum uint64, msg []byte) []byte {
++	return encodeBytes(fieldNum, msg)
++}
++
++// ---- Message encoders -------------------------------------------------------
++
++// localProfileMsg encodes a LocalProfile proto message.
++//
++//	message LocalProfile {
++//	  string local_profile = 1;
++//	  string server_token  = 2;
++//	}
++func localProfileMsg(profile, token string) []byte {
++	var out []byte
++	if profile != "" {
++		out = append(out, encodeString(1, profile)...)
++	}
++	if token != "" {
++		out = append(out, encodeString(2, token)...)
++	}
++	return out
++}
++
++// radioConfigMsg encodes a RadioConfig proto message.
++//
++//	message RadioConfig {
++//	  string server_token  = 1;
++//	  bool   radio_silence = 2;
++//	}
++func radioConfigMsg(token string, silence bool) []byte {
++	var out []byte
++	if token != "" {
++		out = append(out, encodeString(1, token)...)
++	}
++	out = append(out, encodeBool(2, silence)...)
++	return out
++}
++
++// localDevCmdMsg encodes a LocalDevCmd proto message.
++//
++//	message LocalDevCmd {
++//	  string              server_token = 1;
++//	  uint64              timestamp    = 2;
++//	  LocalDevCmd_Command command      = 3;
++//	}
++func localDevCmdMsg(token string, ts uint64, command int) []byte {
++	var out []byte
++	if token != "" {
++		out = append(out, encodeString(1, token)...)
++	}
++	if ts > 0 {
++		out = append(out, encodeUint64(2, ts)...)
++	}
++	if command > 0 {
++		out = append(out, encodeEnum(3, command)...)
++	}
++	return out
++}
++
++// appInstanceIDMsg encodes an AppInstanceID embedded message.
++// AppInstanceID is a simple wrapper around a UUID string in most uses.
++// We encode it as a length-delimited message containing the UUID string at field 1.
++func appInstanceIDMsg(uuidStr string) []byte {
++	// message AppInstanceID { string app_uuid = 1; }
++	return encodeString(1, uuidStr)
++}
++
++// appCommandMsg encodes an AppCommand embedded message.
++//
++//	message AppCommand {
++//	  AppInstanceID id        = 1;
++//	  uint64        timestamp = 2;
++//	  Command       command   = 3;
++//	}
++func appCommandMsg(appUUID string, ts uint64, command int) []byte {
++	var out []byte
++	idMsg := appInstanceIDMsg(appUUID)
++	out = append(out, encodeEmbedded(1, idMsg)...)
++	if ts > 0 {
++		out = append(out, encodeUint64(2, ts)...)
++	}
++	if command > 0 {
++		out = append(out, encodeEnum(3, command)...)
++	}
++	return out
++}
++
++// localAppCmdListMsg encodes a LocalAppCmdList proto message.
++//
++//	message LocalAppCmdList {
++//	  string         server_token = 1;
++//	  repeated AppCommand app_commands = 2;
++//	}
++func localAppCmdListMsg(token string, cmds [][]byte) []byte {
++	var out []byte
++	if token != "" {
++		out = append(out, encodeString(1, token)...)
++	}
++	for _, cmd := range cmds {
++		out = append(out, encodeEmbedded(2, cmd)...)
++	}
++	return out
++}
++
++// ---- LOC compound-config encoding -------------------------------------------
++
++// compoundConfigMsg wraps raw ConfigResponse bytes in the nested proto structure
++// required by the LOC compound-config endpoint:
++//
++//	CompoundEdgeDevConfig {
++//	  protected_config (field 2): AuthContainer {
++//	    protectedPayload (field 1): AuthBody {
++//	      payload (field 1): <configResponseBytes>
++//	    }
++//	  }
++//	}
++//
++// The AuthContainer is unsigned (no signature hash). EVE accepts this when the
++// LOC URL uses plain HTTP, because RemoveAndVerifyAuthContainer skips signature
++// verification for http:// URLs (local-network trust model).
++func compoundConfigMsg(configResponseBytes []byte) []byte {
++	authBody := encodeBytes(1, configResponseBytes) // AuthBody.payload (field 1)
++	authContainer := encodeBytes(1, authBody)       // AuthContainer.protectedPayload (field 1)
++	return encodeBytes(2, authContainer)            // CompoundEdgeDevConfig.protected_config (field 2)
++}
++
++// ---- Config helpers ---------------------------------------------------------
++
++func (s *server) readFile(name string) string {
++	data, err := os.ReadFile(filepath.Join(s.configDir, name))
++	if err != nil {
++		return ""
++	}
++	return strings.TrimSpace(string(data))
++}
++
++func (s *server) readToken() string   { return s.readFile("token") }
++func (s *server) readProfile() string { return s.readFile("profile") }
++
++func (s *server) readRadioSilence() bool {
++	return s.readFile("radio_silence") == "1"
++}
++
++// devCommandJSON represents the optional device command file.
++type devCommandJSON struct {
++	Command   string `json:"command"`
++	Timestamp uint64 `json:"timestamp"`
++}
++
++func (s *server) readDevCommand() *devCommandJSON {
++	data, err := os.ReadFile(filepath.Join(s.configDir, "dev_command"))
++	if err != nil {
++		return nil
++	}
++	var cmd devCommandJSON
++	if err := json.Unmarshal(data, &cmd); err != nil {
++		log.Printf("WARNING: failed to parse dev_command: %v", err)
++		return nil
++	}
++	return &cmd
++}
++
++// appCommandJSON represents a per-app command file under app_commands/.
++type appCommandJSON struct {
++	Command   string `json:"command"`
++	Timestamp uint64 `json:"timestamp"`
++}
++
++// readAppCommands reads all per-app command files from app_commands/ directory.
++// Returns a map from app UUID to command.
++func (s *server) readAppCommands() map[string]appCommandJSON {
++	dir := filepath.Join(s.configDir, "app_commands")
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return nil
++	}
++	result := make(map[string]appCommandJSON)
++	for _, e := range entries {
++		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
++			continue
++		}
++		appUUID := strings.TrimSuffix(e.Name(), ".json")
++		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
++		if err != nil {
++			continue
++		}
++		var cmd appCommandJSON
++		if err := json.Unmarshal(data, &cmd); err != nil {
++			log.Printf("WARNING: failed to parse app_commands/%s: %v", e.Name(), err)
++			continue
++		}
++		result[appUUID] = cmd
++	}
++	return result
++}
++
++// ---- State helpers ----------------------------------------------------------
++
++func (s *server) saveState(name string, data interface{}) {
++	if err := os.MkdirAll(s.stateDir, 0755); err != nil {
++		log.Printf("WARNING: failed to create state dir %s: %v", s.stateDir, err)
++		return
++	}
++	b, err := json.MarshalIndent(data, "", "  ")
++	if err != nil {
++		return
++	}
++	path := filepath.Join(s.stateDir, name)
++	if err := os.WriteFile(path, append(b, '\n'), 0644); err != nil {
++		log.Printf("WARNING: failed to write state %s: %v", path, err)
++	}
++}
++
++// ---- HTTP handlers ----------------------------------------------------------
++
++// handleLocalProfile serves GET /api/v1/local_profile.
++// EVE polls this endpoint to discover a local profile override.
++// Response: LocalProfile proto (200) or empty (204 = no override configured).
++func (s *server) handleLocalProfile(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	log.Printf("GET  /api/v1/local_profile  remote=%s", r.RemoteAddr)
++
++	token := s.readToken()
++	profile := s.readProfile()
++	if profile == "" {
++		// No profile configured: tell EVE there is no local override.
++		w.WriteHeader(http.StatusNoContent)
++		return
++	}
++
++	msg := localProfileMsg(profile, token)
++	w.Header().Set("Content-Type", contentTypeProto)
++	w.WriteHeader(http.StatusOK)
++	if _, err := w.Write(msg); err != nil {
++		log.Printf("ERROR: writing local_profile response: %v", err)
++	}
++	log.Printf("  -> local_profile=%q token_len=%d", profile, len(token))
++}
++
++// handleRadio serves POST /api/v1/radio.
++// EVE reports wireless adapter status; LPS responds with optional radio-silence config.
++func (s *server) handleRadio(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
++	log.Printf("POST /api/v1/radio          remote=%s body=%dB", r.RemoteAddr, len(body))
++	s.saveState("last_radio.json", map[string]interface{}{
++		"timestamp":   time.Now().UTC().Format(time.RFC3339),
++		"remote_addr": r.RemoteAddr,
++		"body_bytes":  len(body),
++	})
++
++	silence := s.readRadioSilence()
++	if !silence {
++		w.WriteHeader(http.StatusNoContent)
++		return
++	}
++
++	token := s.readToken()
++	msg := radioConfigMsg(token, true)
++	w.Header().Set("Content-Type", contentTypeProto)
++	w.WriteHeader(http.StatusOK)
++	if _, err := w.Write(msg); err != nil {
++		log.Printf("ERROR: writing radio response: %v", err)
++	}
++	log.Printf("  -> radio_silence=true")
++}
++
++// handleAppInfo serves POST /api/v1/appinfo.
++// EVE reports running app instances; LPS responds with optional app commands.
++func (s *server) handleAppInfo(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
++	log.Printf("POST /api/v1/appinfo        remote=%s body=%dB", r.RemoteAddr, len(body))
++	s.saveState("last_appinfo.json", map[string]interface{}{
++		"timestamp":   time.Now().UTC().Format(time.RFC3339),
++		"remote_addr": r.RemoteAddr,
++		"body_bytes":  len(body),
++	})
++
++	appCmds := s.readAppCommands()
++	if len(appCmds) == 0 {
++		w.WriteHeader(http.StatusNoContent)
++		return
++	}
++
++	token := s.readToken()
++	var cmds [][]byte
++	for appUUID, cmd := range appCmds {
++		var cmdCode int
++		switch strings.ToLower(cmd.Command) {
++		case "restart":
++			cmdCode = appCmdRestart
++		case "purge":
++			cmdCode = appCmdPurge
++		default:
++			log.Printf("WARNING: unknown app command %q for %s, skipping", cmd.Command, appUUID)
++			continue
++		}
++		ts := cmd.Timestamp
++		if ts == 0 {
++			ts = uint64(time.Now().Unix())
++		}
++		cmds = append(cmds, appCommandMsg(appUUID, ts, cmdCode))
++		log.Printf("  -> app command: uuid=%s cmd=%s ts=%d", appUUID, cmd.Command, ts)
++	}
++
++	if len(cmds) == 0 {
++		w.WriteHeader(http.StatusNoContent)
++		return
++	}
++
++	msg := localAppCmdListMsg(token, cmds)
++	w.Header().Set("Content-Type", contentTypeProto)
++	w.WriteHeader(http.StatusOK)
++	if _, err := w.Write(msg); err != nil {
++		log.Printf("ERROR: writing appinfo response: %v", err)
++	}
++}
++
++// handleDevInfo serves POST /api/v1/devinfo.
++// EVE reports device state; LPS responds with optional device commands (reboot, shutdown, etc.).
++func (s *server) handleDevInfo(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
++	log.Printf("POST /api/v1/devinfo        remote=%s body=%dB", r.RemoteAddr, len(body))
++	s.saveState("last_devinfo.json", map[string]interface{}{
++		"timestamp":   time.Now().UTC().Format(time.RFC3339),
++		"remote_addr": r.RemoteAddr,
++		"body_bytes":  len(body),
++	})
++
++	devCmd := s.readDevCommand()
++	if devCmd == nil || devCmd.Command == "" {
++		w.WriteHeader(http.StatusNoContent)
++		return
++	}
++
++	var cmdCode int
++	switch strings.ToLower(devCmd.Command) {
++	case "shutdown":
++		cmdCode = devCmdShutdown
++	case "poweroff", "shutdown_poweroff":
++		cmdCode = devCmdShutdownPoweroff
++	case "reboot", "graceful_reboot":
++		cmdCode = devCmdGracefulReboot
++	case "collect_info":
++		cmdCode = devCmdCollectInfo
++	default:
++		log.Printf("WARNING: unknown device command %q, ignoring", devCmd.Command)
++		w.WriteHeader(http.StatusNoContent)
++		return
++	}
++
++	token := s.readToken()
++	ts := devCmd.Timestamp
++	if ts == 0 {
++		ts = uint64(time.Now().Unix())
++	}
++
++	msg := localDevCmdMsg(token, ts, cmdCode)
++	w.Header().Set("Content-Type", contentTypeProto)
++	w.WriteHeader(http.StatusOK)
++	if _, err := w.Write(msg); err != nil {
++		log.Printf("ERROR: writing devinfo response: %v", err)
++	}
++	log.Printf("  -> device command: cmd=%s ts=%d", devCmd.Command, ts)
++}
++
++// handleLocation serves POST /api/v1/location.
++// EVE reports GNSS-derived device location; LPS acknowledges with 200 OK.
++func (s *server) handleLocation(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
++	log.Printf("POST /api/v1/location       remote=%s body=%dB", r.RemoteAddr, len(body))
++	s.saveState("last_location.json", map[string]interface{}{
++		"timestamp":   time.Now().UTC().Format(time.RFC3339),
++		"remote_addr": r.RemoteAddr,
++		"body_bytes":  len(body),
++	})
++	w.WriteHeader(http.StatusOK)
++}
++
++// handleNetwork serves POST /api/v1/network.
++// EVE reports network adapter config; LPS responds with optional local network overrides.
++func (s *server) handleNetwork(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
++	log.Printf("POST /api/v1/network        remote=%s body=%dB", r.RemoteAddr, len(body))
++	// No local network overrides configured; return 204.
++	w.WriteHeader(http.StatusNoContent)
++}
++
++// handleCompoundConfig serves POST /api/v2/edgedevice/id/{uuid}/compound-config.
++// This is the LOC (Local Operator Console) endpoint. EVE calls it when a
++// controller-provided LOC URL points here and the controller is unreachable.
++//
++// The response is a CompoundEdgeDevConfig proto wrapping a ConfigResponse
++// (containing EdgeDevConfig) in an unsigned AuthContainer. EVE skips signature
++// verification for http:// LOC URLs (local-network trust model).
++//
++// The inner ConfigResponse proto binary is read from:
++//
++//	<configDir>/loc-config.bin
++//
++// If the file does not exist, 204 No Content is returned (no config available).
++func (s *server) handleCompoundConfig(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	// Consume (and discard) the CompoundEdgeDevConfigRequest body.
++	io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
++	log.Printf("POST %s  remote=%s", r.URL.Path, r.RemoteAddr)
++
++	configResponseBytes, err := os.ReadFile(filepath.Join(s.configDir, "loc-config.bin"))
++	if err != nil {
++		// No VM config available yet — tell EVE to keep its current config.
++		log.Printf("  -> no loc-config.bin, returning 204")
++		w.WriteHeader(http.StatusNoContent)
++		return
++	}
++
++	msg := compoundConfigMsg(configResponseBytes)
++	w.Header().Set("Content-Type", contentTypeProto)
++	w.WriteHeader(http.StatusOK)
++	if _, err := w.Write(msg); err != nil {
++		log.Printf("ERROR: writing compound-config response: %v", err)
++	}
++	log.Printf("  -> compound-config: %dB inner config, %dB response", len(configResponseBytes), len(msg))
++}
++
++// handleAppBootInfo serves POST /api/v1/appbootinfo.
++// EVE reports effective boot order per app; LPS responds with optional boot config.
++func (s *server) handleAppBootInfo(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
++	log.Printf("POST /api/v1/appbootinfo    remote=%s body=%dB", r.RemoteAddr, len(body))
++	// No boot order overrides configured; return 204.
++	w.WriteHeader(http.StatusNoContent)
++}
++
++// ---- main -------------------------------------------------------------------
++
++func main() {
++	port := flag.String("port", "8888", "TCP port to listen on")
++	configDir := flag.String("config", "/config/lps", "Config directory (token, profile, radio_silence files)")
++	stateDir := flag.String("state", "/persist/lps", "State directory (last_* JSON state files)")
++	flag.Parse()
++
++	// Environment variable overrides (useful for container deployments).
++	if p := os.Getenv("LPS_PORT"); p != "" {
++		*port = p
++	}
++	if c := os.Getenv("LPS_CONFIG_DIR"); c != "" {
++		*configDir = c
++	}
++	if st := os.Getenv("LPS_STATE_DIR"); st != "" {
++		*stateDir = st
++	}
++
++	if err := os.MkdirAll(*stateDir, 0755); err != nil {
++		log.Fatalf("Cannot create state directory %s: %v", *stateDir, err)
++	}
++
++	srv := &server{
++		configDir: *configDir,
++		stateDir:  *stateDir,
++	}
++
++	mux := http.NewServeMux()
++	// Static file server for disk images stored in <stateDir>/images/.
++	// EVE downloader fetches images via HTTP; place qcow2/raw files under
++	// /persist/lps/images/ and reference them as http://localhost:8888/images/<file>.
++	imagesDir := filepath.Join(*stateDir, "images")
++	if err := os.MkdirAll(imagesDir, 0755); err != nil {
++		log.Fatalf("Cannot create images directory %s: %v", imagesDir, err)
++	}
++	mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir(imagesDir))))
++
++	mux.HandleFunc("/api/v1/local_profile", srv.handleLocalProfile)
++	mux.HandleFunc("/api/v1/radio", srv.handleRadio)
++	mux.HandleFunc("/api/v1/appinfo", srv.handleAppInfo)
++	mux.HandleFunc("/api/v1/devinfo", srv.handleDevInfo)
++	mux.HandleFunc("/api/v1/location", srv.handleLocation)
++	mux.HandleFunc("/api/v1/network", srv.handleNetwork)
++	mux.HandleFunc("/api/v1/appbootinfo", srv.handleAppBootInfo)
++	// LOC compound-config endpoint: /api/v2/edgedevice/id/{uuid}/compound-config
++	mux.HandleFunc("/api/v2/edgedevice/", srv.handleCompoundConfig)
++
++	addr := fmt.Sprintf(":%s", *port)
++	log.Printf("EVE LPS server starting on %s", addr)
++	log.Printf("  config dir : %s", *configDir)
++	log.Printf("  state dir  : %s", *stateDir)
++	log.Printf("")
++	log.Printf("Config files (create to activate features):")
++	log.Printf("  %s/token          — LPS token (must match controller-provisioned value)", *configDir)
++	log.Printf("  %s/profile        — local profile name to advertise", *configDir)
++	log.Printf("  %s/radio_silence  — '1' to enable radio silence, '0' or absent to disable", *configDir)
++	log.Printf("  %s/dev_command    — JSON: {\"command\":\"reboot|shutdown|poweroff|collect_info\",\"timestamp\":0}", *configDir)
++	log.Printf("  %s/app_commands/  — dir: one JSON per app UUID: {\"command\":\"restart|purge\",\"timestamp\":0}", *configDir)
++	log.Printf("")
++
++	httpSrv := &http.Server{
++		Addr:         addr,
++		Handler:      mux,
++		ReadTimeout:  30 * time.Second,
++		WriteTimeout: 30 * time.Second,
++		IdleTimeout:  120 * time.Second,
++	}
++
++	if err := httpSrv.ListenAndServe(); err != nil {
++		log.Fatalf("LPS server error: %v", err)
++	}
++}
+diff --git a/pkg/pillar/cmd/zedagent/handleconfig.go b/pkg/pillar/cmd/zedagent/handleconfig.go
+index 30486a12e..c33975c0c 100644
+--- a/pkg/pillar/cmd/zedagent/handleconfig.go
++++ b/pkg/pillar/cmd/zedagent/handleconfig.go
+@@ -772,7 +772,10 @@ func requestConfigByURL(getconfigCtx *getconfigContext, url string,
+ 		// config. Store auth container stream for further saving it into the
+ 		// file.
+ 		authWrappedRV = rv
+-		err = ctrlClient.RemoveAndVerifyAuthContainer(&rv, false)
++		// Skip signature verification for HTTP LOC (local-network trust model;
++		// no controller signing key available in airgap/dev deployments).
++		skipAuthVerify := strings.HasPrefix(url, "http:")
++		err = ctrlClient.RemoveAndVerifyAuthContainer(&rv, skipAuthVerify)
+ 		if err != nil {
+ 			log.Errorf("RemoveAndVerifyAuthContainer: %s", err)
+ 		}
+@@ -876,6 +879,18 @@ func getLatestConfig(getconfigCtx *getconfigContext, iteration int,
+ 	rv, tracedReqs := requestConfigByURL(getconfigCtx, url, false,
+ 		iteration, withNetTracing, getconfigCtx.zedagentCtx.airgapMode)
+ 
++	// Bootstrap LOC URL from /config/loc/url when the controller is unreachable
++	// and no LOC URL has been provisioned by the controller yet.
++	// This allows airgap/dev deployments to use a local LOC without a cloud controller.
++	if rv != configOK && getconfigCtx.locConfig == nil {
++		if data, err := os.ReadFile("/config/loc/url"); err == nil {
++			if locURL := strings.TrimSpace(string(data)); locURL != "" {
++				log.Noticef("getLatestConfig: bootstrapping LOC URL from /config/loc/url: %s", locURL)
++				getconfigCtx.locConfig = &types.LOCConfig{LocURL: locURL}
++			}
++		}
++	}
++
+ 	// Request configuration from the LOC
+ 	if needRequestLocConfig(getconfigCtx, rv) {
+ 		locURL := getconfigCtx.locConfig.LocURL
+diff --git a/pkg/storage-init/storage-init.sh b/pkg/storage-init/storage-init.sh
+index c1a3dd62c..ab8bab738 100755
+--- a/pkg/storage-init/storage-init.sh
++++ b/pkg/storage-init/storage-init.sh
+@@ -306,6 +306,9 @@ chmod 700 $UUID_SYMLINK_PATH
+ # create /run/edgeview early before the disk mount for edgeview container
+ mkdir -p /run/edgeview
+ 
++# create /persist/lps for the LPS server container bind mount
++mkdir -p /persist/lps
++
+ BLK_DEVICES=$(ls /sys/class/block/)
+ for BLK_DEVICE in $BLK_DEVICES; do
+     BLK_UUID=$(blkid "/dev/$BLK_DEVICE" | sed -n 's/.*UUID=//p' | sed 's/"//g' | awk '{print $1}')
+diff --git a/tools/parse-pkgs.sh b/tools/parse-pkgs.sh
+index 64ec760ea..33b3a62ee 100755
+--- a/tools/parse-pkgs.sh
++++ b/tools/parse-pkgs.sh
+@@ -151,6 +151,7 @@ RECOVERTPM_TAG=${RECOVERTPM_TAG}
+ UDEV_TAG=${UDEV_TAG}
+ INSTALLER_TAG=${INSTALLER_TAG}
+ MONITOR_TAG=${MONITOR_TAG}
++LPS_TAG=${LPS_TAG}
+ EOF
+ }
+ 
+@@ -196,6 +197,7 @@ RECOVERTPM_TAG=$(linuxkit_tag pkg/recovertpm)
+ UDEV_TAG=$(linuxkit_tag pkg/udev)
+ INSTALLER_TAG=$(linuxkit_tag pkg/installer)
+ MONITOR_TAG=$(linuxkit_tag pkg/monitor)
++LPS_TAG=$(linuxkit_tag pkg/lps)
+ 
+ # Synthetic tags: the following tags are based on hashing
+ # the contents of all the Dockerfile.in that we can find.
+-- 
+2.51.0
+

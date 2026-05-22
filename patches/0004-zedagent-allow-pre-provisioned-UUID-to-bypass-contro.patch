@@ -1,0 +1,58 @@
+From 3d30a46c51c140ba46b2b327edd79feb20159fc2 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Fri, 6 Mar 2026 13:26:54 +0000
+Subject: [PATCH] zedagent: allow pre-provisioned UUID to bypass
+ controller onboarding
+
+In airgap/dev deployments without a cloud controller, zedagent blocks
+forever in waitUntilOnboarded because zedclient cannot contact the
+controller to register the device and obtain a UUID.
+
+If /config/device-uuid exists (baked into the CONFIG partition), use
+that UUID immediately instead of waiting for OnboardingStatus from
+zedclient. This unblocks configTimerTask so the LOC bootstrap can
+proceed and provide full device configuration locally.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ conf/device-uuid                    |  1 +
+ pkg/pillar/cmd/zedagent/zedagent.go | 15 +++++++++++++++
+ 2 files changed, 16 insertions(+)
+ create mode 100644 conf/device-uuid
+
+diff --git a/conf/device-uuid b/conf/device-uuid
+new file mode 100644
+index 000000000..2ff2b13e9
+--- /dev/null
++++ b/conf/device-uuid
+@@ -0,0 +1 @@
++77f1fea9-fdb6-5bbc-aa5f-4bba153bd380
+diff --git a/pkg/pillar/cmd/zedagent/zedagent.go b/pkg/pillar/cmd/zedagent/zedagent.go
+index fc8e9ad3f..5b2499b9f 100644
+--- a/pkg/pillar/cmd/zedagent/zedagent.go
++++ b/pkg/pillar/cmd/zedagent/zedagent.go
+@@ -717,6 +717,21 @@ func initializeDirs() {
+ 
+ func waitUntilOnboarded(zedagentCtx *zedagentContext, stillRunning *time.Ticker) {
+ 	nilUUID := uuid.UUID{}
++
++	// For airgap/dev deployments without a cloud controller, allow a
++	// pre-provisioned UUID in /config/device-uuid to bypass controller
++	// onboarding. This unblocks the config-fetch loop so LOC can provide
++	// the full device configuration locally.
++	if devUUID == nilUUID {
++		if data, err := os.ReadFile("/config/device-uuid"); err == nil {
++			if u, err := uuid.FromString(strings.TrimSpace(string(data))); err == nil && u != nilUUID {
++				devUUID = u
++				log.Noticef("waitUntilOnboarded: using pre-provisioned UUID from /config/device-uuid: %s", devUUID)
++				return
++			}
++		}
++	}
++
+ 	for devUUID == nilUUID {
+ 		log.Functionf("Waiting for OnboardStatus UUID")
+ 		select {
+-- 
+2.51.0
+

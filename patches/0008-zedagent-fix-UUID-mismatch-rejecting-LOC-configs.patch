@@ -1,0 +1,39 @@
+From 5a198bd59ea8d92f35d2f6699e9f00052fd74ed5 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 10 Mar 2026 09:12:11 +0000
+Subject: [PATCH] zedagent: fix UUID mismatch rejecting LOC configs
+
+inhaleDeviceConfig checks config.GetId().Uuid against the device UUID
+and returns invalidConfig if they differ, silently dropping the entire
+LOC config without publishing any AppInstanceConfig.
+
+LOC configs don't carry a device UUID assertion (they're served locally
+and don't need to identify the device), so remove the Id field from
+gen-loc-config output. The nil Id is already safe: inhaleDeviceConfig
+skips the UUID check when Id is nil.
+
+Also fix the remaining config.GetId().Uuid field access (non-nil-safe)
+in parseAppInstanceConfig to use the proto getter GetUuid() instead,
+consistent with the earlier fix in parseedgenodeinfo.go.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/zedagent/parseconfig.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/pkg/pillar/cmd/zedagent/parseconfig.go b/pkg/pillar/cmd/zedagent/parseconfig.go
+index 9a12ceeb1..ad11be724 100644
+--- a/pkg/pillar/cmd/zedagent/parseconfig.go
++++ b/pkg/pillar/cmd/zedagent/parseconfig.go
+@@ -644,7 +644,7 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
+ 		appinstancePrevConfigHash, configHash, Apps)
+ 	appinstancePrevConfigHash = configHash
+ 
+-	devUUIDStr := config.GetId().Uuid
++	devUUIDStr := config.GetId().GetUuid()
+ 
+ 	// First look for deleted ones. Look for Apps that exists on EVE OS, but not in the config
+ 	// file from the server. If yes, we will remove the App from the EVE OS.
+-- 
+2.51.0
+

@@ -1,0 +1,26 @@
+From 5bc7eb11a9a7695890c7963c1061152fdfe3a597 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 10 Mar 2026 08:36:19 +0000
+Subject: [PATCH] Makefile: Increase rootfs for x86 to 4096MB
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index f2c4f0e26..66456457b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -490,7 +490,7 @@ else
+             ROOTFS_MAXSIZE_MB=9999
+         # nvidia platform requires more space
+         else ifeq (, $(findstring nvidia,$(PLATFORM)))
+-            ROOTFS_MAXSIZE_MB=290
++            ROOTFS_MAXSIZE_MB=4096
+         else
+             ROOTFS_MAXSIZE_MB=450
+         endif
+-- 
+2.51.0
+
