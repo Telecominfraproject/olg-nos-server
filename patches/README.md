@@ -22,3 +22,4 @@
 | 0016 | `downloader` | treat localhost/loopback datastores as local | `pkg/pillar/cmd/downloader/syncop.go` |
 | 0017 | `build.sh` | Add script to build ms-01 installer | `build.sh` |
 | 0018 | `gen-loc-config` | hw-id binding for every VIF, not just LMP | `pkg/pillar/cmd/gen-loc-config/main.go` |
+| 0019 | `gen-loc-config` | delete baked-in ethernet on LAN bridge members | `pkg/pillar/cmd/gen-loc-config/main.go` |
