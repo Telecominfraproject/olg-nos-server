@@ -252,6 +252,32 @@ rm -f cache/<rev>/dist/amd64/snapshot/live.*    # or installer.*, target.img, et
 BuildKit prunes redundant layers automatically during builds — disk
 usage often drops mid-build, don't be surprised.
 
+### Recovering from a killed / failed eve build
+
+`linuxkit-builder` is a long-lived `moby/buildkit` container with an
+anonymous volume mounted at `/var/lib/buildkit` for its layer cache. If
+a build is killed mid-flight (Ctrl-C, OOM, disk-full) the container is
+left in `Exited` state and the volume keeps its in-progress layers —
+routinely 40–50 GB. That volume is **not** visible to `docker buildx du`
+(separate buildkit instance) and **not** reclaimed by
+`docker system prune` or `docker volume prune -f` while the container
+still references it.
+
+Recovery, in order:
+
+```sh
+docker rm -v linuxkit-builder   # drops container AND its anon volume
+docker volume prune -f          # mop up orphans
+docker image prune -af          # unused images
+df -h /
+```
+
+The next `make pkg/<x>` recreates `linuxkit-builder` with an empty
+cache — so the first rebuild is slow, but subsequent ones cache
+normally. Don't try to `buildctl prune` the live container first;
+the buildkit DB only knows about layers it produced *after* the most
+recent build, not the half-written ones the kill left behind.
+
 ## Commit message convention
 
 Patches use `<scope>: <subject>` where scope is a short tag matching the
