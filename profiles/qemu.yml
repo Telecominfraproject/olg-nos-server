@@ -35,9 +35,12 @@ mgmt_uplink: eth0
 # matching e1000e devices behind their own pcie-root-ports — i.e.
 # `make run-live E1000E=1`. The PciLong + IOMMU group values come from
 # the EVE host's `lspci -D` and `/sys/kernel/iommu_groups/`.
+#
+# pt_e1k_wan is backed by an outer-QEMU slirp NAT (192.168.5.0/24),
+# giving VyOS its own internet egress independent of EVE's mgmt eth0.
+# vyos.wan points at it so the WAN role lands on a NIC that actually
+# reaches the host network.
 interfaces:
-  - name: eth0
-    type: switch
   - name: pt_e1k0
     type: pcie
     pci: 0000:01:00.0
@@ -48,6 +51,11 @@ interfaces:
     pci: 0000:02:00.0
     assigngrp: group10
     mac: '52:54:00:e1:00:01'
+  - name: pt_e1k_wan
+    type: pcie
+    pci: 0000:03:00.0
+    assigngrp: group11
+    mac: '52:54:00:e1:00:02'
 
 vnc_passwd: "eve"
 
@@ -56,10 +64,14 @@ ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKFz5k4h6F0KEKmxygyHTfNY+eJuHr3Ken
 output: conf/lps/loc-config.bin
 
 vyos:
-  wan: eth1
+  # ethN naming inside the VM (sequential PCIe assignment after the LMP VIF):
+  #   eth0 = LMP virtio VIF
+  #   eth1 = pt_e1k0   (dummy slirp 192.168.3.0/24, no NAT egress)
+  #   eth2 = pt_e1k1   (dummy slirp 192.168.4.0/24, no NAT egress)
+  #   eth3 = pt_e1k_wan (slirp 192.168.5.0/24 with NAT to host — actual WAN)
+  wan: eth3
   lmp_name: eth0
-  lan:
-    - eth0
+  lan: []
   # 192.168.33.0/24 keeps the inner VyOS LAN distinct from the EVE QEMU
   # outer user-net (192.168.1.0/24, where EVE gets 192.168.1.10 and
   # 192.168.1.2 is the QEMU NAT host stub). Picking the same /24 caused

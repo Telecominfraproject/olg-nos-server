@@ -1,0 +1,52 @@
+From c017a07f32b4c99f7d29b8935d01ecb35f2a305d Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 26 May 2026 19:58:00 +0000
+Subject: [PATCH] Makefile: add slirp-backed E1000E for VyOS WAN testing
+
+Adds a third E1000E PCIe device on its own pcie-root-port (chassis=12,
+addr=0x12), backed by an outer-QEMU user-net slirp on 192.168.5.0/24.
+When passed through to a guest VM via VFIO, this gives the guest its
+own NAT'd internet egress independent of EVE's mgmt eth0.
+
+Unblocks end-to-end testing of "VyOS shares internet to EVE": today
+VyOS comes up over the existing two E1000E passthrough devices but
+they're dummy (no upstream slirp), so VyOS has no WAN to share.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ Makefile | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 177a64cb4..c414db5a0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -318,8 +318,11 @@ else
+ QEMU_OPTS_eth1=-netdev user,id=eth1,net=$(IPS_NET2),dhcpstart=$(IPS_NET2_FIRST_IP) -device virtio-net-pci,netdev=eth1,romfile=""
+ endif
+ 
+-# Two e1000e NICs each behind a dedicated pcie-root-port for IOMMU isolation,
+-# so EVE can hand them off to a guest VM via vfio PCIe passthrough.
++# Three e1000e NICs each behind a dedicated pcie-root-port for IOMMU isolation,
++# so EVE can hand them off to a guest VM via vfio PCIe passthrough. The third
++# one is backed by a slirp user-net so the passthrough guest (VyOS) has its
++# own NAT'd uplink independent of EVE's mgmt eth0; this is what lets us test
++# "VyOS shares internet to EVE" end-to-end in QEMU.
+ # Activated when E1000E=1 is passed on the make command line.
+ ifeq ($(E1000E),1)
+ QEMU_OPTS_e1000e=\
+@@ -328,7 +331,10 @@ QEMU_OPTS_e1000e=\
+ 	-device e1000e,netdev=eth2,bus=rp.e1k1,addr=0x0,mac=52:54:00:e1:00:00 \
+ 	-device pcie-root-port,id=rp.e1k2,chassis=11,addr=0x11 \
+ 	-netdev user,id=eth3,net=192.168.4.0/24,dhcpstart=192.168.4.10 \
+-	-device e1000e,netdev=eth3,bus=rp.e1k2,addr=0x0,mac=52:54:00:e1:00:01
++	-device e1000e,netdev=eth3,bus=rp.e1k2,addr=0x0,mac=52:54:00:e1:00:01 \
++	-device pcie-root-port,id=rp.e1k3,chassis=12,addr=0x12 \
++	-netdev user,id=eth4,net=192.168.5.0/24,dhcpstart=192.168.5.10 \
++	-device e1000e,netdev=eth4,bus=rp.e1k3,addr=0x0,mac=52:54:00:e1:00:02
+ endif
+ 
+ QEMU_OPTS_amd64=-smbios type=1,serial=$(QEMU_EVE_SERIAL)
+-- 
+2.51.0
+
