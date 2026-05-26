@@ -10,16 +10,15 @@
 | 0004 | `zedagent` | allow pre-provisioned UUID to bypass controller onboarding | `conf/device-uuid`, `pkg/pillar/cmd/zedagent/zedagent.go` |
 | 0005 | `zedagent` | don't fatal on missing TLS certs in airgap mode | `pkg/pillar/cmd/zedagent/handleconfig.go` |
 | 0006 | `wait` | bypass controller onboarding when /config/device-uuid is present | `pkg/pillar/utils/wait/waitfor.go` |
-| 0007 | `zedagent` | fix nil panic in parseEdgeNodeInfo for LOC configs | `pkg/pillar/cmd/zedagent/parseedgenodeinfo.go` |
-| 0008 | `zedagent` | fix UUID mismatch rejecting LOC configs | `pkg/pillar/cmd/zedagent/parseconfig.go` |
-| 0009 | `Makefile` | Increase rootfs for x86 to 4096MB | `Makefile` |
-| 0010 | `Makefile` | generate loc config during build time | `Makefile` |
-| 0011 | `gen-loc-config` | add firewall rule to allow traffic on lmp | `pkg/pillar/cmd/gen-loc-config/main.go` |
-| 0012 | `gen-loc-config` | add support for EnforceNetworkInterfaceOrder | `pkg/pillar/cmd/gen-loc-config/main.go` |
-| 0013 | `gen-loc-config` | add cloud-init support | `pkg/pillar/cmd/gen-loc-config/main.go` |
-| 0014 | `gen-loc-config` | stable LMP NIC naming via deterministic MAC and VyOS hw-id | `pkg/pillar/cmd/gen-loc-config/main.go` |
-| 0015 | `gen-loc-config` | print cloud-init user-data in summary | `pkg/pillar/cmd/gen-loc-config/main.go` |
-| 0016 | `dpcmanager` | exclude PhyIoUsageDedicated ports from last-resort DPC | `pkg/pillar/dpcmanager/lastresort.go`, `pkg/pillar/types/assignableadapters.go` |
-| 0017 | `downloader` | skip mDNS for localhost/loopback datastores | `pkg/pillar/cmd/downloader/syncop.go` |
-| 0018 | `downloader` | treat localhost/loopback datastores as local | `pkg/pillar/cmd/downloader/syncop.go` |
-| 0019 | `build.sh` | Add script to build ms-01 installer | `build.sh` |
+| 0007 | `zedagent` | fix nil panic in parseEdgeNodeInfo for LOC configs | `pkg/pillar/cmd/zedagent/parseconfig.go`, `pkg/pillar/cmd/zedagent/parseedgenodeinfo.go` |
+| 0008 | `Makefile` | Increase rootfs for x86 to 4096MB | `Makefile` |
+| 0009 | `Makefile` | generate loc config during build time | `Makefile` |
+| 0010 | `gen-loc-config` | add firewall rule to allow traffic on lmp | `pkg/pillar/cmd/gen-loc-config/main.go` |
+| 0011 | `gen-loc-config` | add support for EnforceNetworkInterfaceOrder | `pkg/pillar/cmd/gen-loc-config/main.go` |
+| 0012 | `gen-loc-config` | add cloud-init support | `pkg/pillar/cmd/gen-loc-config/main.go` |
+| 0013 | `gen-loc-config` | stable LMP NIC naming via deterministic MAC and VyOS hw-id | `pkg/pillar/cmd/gen-loc-config/main.go` |
+| 0014 | `gen-loc-config` | print cloud-init user-data in summary | `pkg/pillar/cmd/gen-loc-config/main.go` |
+| 0015 | `dpcmanager` | exclude PhyIoUsageDedicated ports from last-resort DPC | `pkg/pillar/dpcmanager/lastresort.go`, `pkg/pillar/types/assignableadapters.go` |
+| 0016 | `downloader` | treat localhost/loopback datastores as local | `pkg/pillar/cmd/downloader/syncop.go` |
+| 0017 | `build.sh` | Add script to build ms-01 installer | `build.sh` |
+| 0018 | `gen-loc-config` | hw-id binding for every VIF, not just LMP | `pkg/pillar/cmd/gen-loc-config/main.go` |

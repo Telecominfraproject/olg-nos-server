@@ -1,0 +1,274 @@
+From 014ea5d072eeae0655d559eb007e3197968688ac Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Fri, 22 May 2026 17:41:43 +0000
+Subject: [PATCH] gen-loc-config: hw-id binding for every VIF, not just LMP
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Generalizes the deterministic-MAC mechanism patch 0009 introduced for the
+LMP NIC so every virtual NIC handed to the VyOS guest is anchored to a
+stable MAC and the matching hw-id config line is emitted in cloud-init.
+
+Before: only HWIDs[<lmp_name>] = lmp_mac was populated; non-LMP VIFs
+(uplink, switch NIs) had no MacAddress set in their NetworkAdapter
+entries — domainmgr generated runtime MACs and no hw-id line was emitted,
+so VyOS's view of those interfaces floated with kernel probe order. User
+hit "sometimes WAN is not eth0 but eth1" on ms-01 because of this.
+
+After: every VIF gets a deterministic MAC via vifMACFromUUIDs(appUUID,
+niUUID, adapterNum) — adapterNum 0=LMP, 1=uplink, 2+ = switch NIs. The
+NetworkAdapter.MacAddress field carries it to domainmgr (so the guest
+NIC has the expected MAC), and HWIDs[ethN] is populated for each
+guest-side interface name. The cloud-init emitter (unchanged) writes
+`set interfaces ethernet ethN hw-id '<mac>'` for every entry. VyOS now
+anchors every interface's config to a MAC, not to whichever ethN the
+kernel happened to assign.
+
+lmpMACFromUUIDs is kept as a thin wrapper over vifMACFromUUIDs(_, _, 0)
+for clarity at the LMP call site.
+
+Hardware (PCIe-passthrough) NICs are still unsolved by this patch — their
+vendor MACs aren't known at build time. Follow-up: discover them at boot
+from /sys/bus/pci/.../net/<iface>/address and substitute into the
+cloud-init template.
+
+gen-loc-config: always enforce VIF interface order
+
+Patch "hw-id binding for every VIF" assumed pillar/domainmgr would honour
+the InterfaceOrder field on every NetworkAdapter so that LMP at order=1
+lands at the lowest guest PCI slot (kernel eth0) and switch NIs at
+order=2+ follow as eth1+. That is only true when
+EnforceNetworkInterfaceOrder is set.
+
+gen-loc-config previously gated it on `len(pcieAdapters) > 0`, so the
+qemu profile (no PCIe) got it `false` — pillar then placed the switch
+NI at the lower PCI slot, the LMP at the higher one, and the VyOS hw-id
+config (which the previous patch built from InterfaceOrder) ended up
+inverted vs kernel reality. VyOS's commit handler tried to reconcile
+and corrupted kernel MACs (both ethN reporting the same address).
+
+Setting EnforceNetworkInterfaceOrder unconditionally makes the
+build-time HWIDs map match the runtime kernel naming. The qemu profile
+now produces stable hw-id bindings on both eth0 and eth1.
+
+gen-loc-config: drop hw-id cidata directives
+
+The hw-id-for-every-VIF logic emitted `set interfaces ethernet <iface>
+hw-id '<mac>'` for every interface in VyOS cidata. VyOS's
+[interfaces_ethernet] validator rejects this on bridge members at commit
+time:
+
+  Cannot assign address to interface "eth0" as it is a member of bridge
+
+That made first-boot cidata commit fail (alongside a separate transient
+"NAT translation requires address" warning), leaving VyOS with a
+half-applied config: br0 configured but DOWN, eth0 stuck with no IP,
+network unreachable until manual repair.
+
+The whole hw-id mechanism is redundant in EVE's current setup:
+
+  1. EnforceNetworkInterfaceOrder=true (set unconditionally just below)
+     pins each VIF to a deterministic PCI bus slot via VifOrder, so the
+     same VM config always lands at the same pci.N addresses across
+     reboots.
+  2. VyOS's live-build kernel cmdline carries `net.ifnames=0
+     biosdevname=0`, so the kernel uses legacy ethN names in PCI
+     enumeration order.
+
+Together those guarantee `eth0 = first VIF, eth1 = second, ...`
+unconditionally — VyOS sees stable names without any hw-id config.
+
+Drop the emission, drop the now-unused `HWIDs` map field, drop its
+population. First-boot cidata apply now succeeds in one pass.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 119 +++++++++++++++-----------
+ 1 file changed, 69 insertions(+), 50 deletions(-)
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index f27c0503a..5bd911dec 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -75,12 +75,10 @@ type VyOSConfig struct {
+ 	CIOutput    string   `yaml:"ci_output"`    // output path for the cloud-init ISO
+ 	Commands    []string `yaml:"commands"`     // additional VyOS set commands appended last
+ 	// LMPName is the interface name VyOS will use for the LMP virtio NIC.
+-	// VyOS renames the NIC (via a udev hw-id rule) to this name on boot.
+-	// Defaults to "eth100" if not set.
++	// Kernel-side ethN naming is determined by PCI bus order (anchored by
++	// EVE's EnforceNetworkInterfaceOrder) plus VyOS's `net.ifnames=0
++	// biosdevname=0` kernel cmdline. Defaults to "eth100" if not set.
+ 	LMPName string `yaml:"lmp_name"`
+-	// HWIDs maps VyOS interface names to MAC addresses for hw-id binding.
+-	// Populated automatically by gen-loc-config; no need to set in the profile.
+-	HWIDs map[string]string `yaml:"-"`
+ }
+ 
+ // Profile describes a compile-time machine configuration loaded from a YAML file.
+@@ -142,11 +140,17 @@ func generateVyOSUserData(vyosCfg *VyOSConfig) string {
+ 		add("set system host-name '" + v.Hostname + "'")
+ 	}
+ 
+-	// hw-id bindings: pin each interface name to its MAC address so VyOS
+-	// finds the right NIC regardless of PCI enumeration order.
+-	for iface, mac := range v.HWIDs {
+-		add("set interfaces ethernet " + iface + " hw-id '" + mac + "'")
+-	}
++	// Deterministic ethN naming is guaranteed by two existing mechanisms:
++	//   1. EVE's `EnforceNetworkInterfaceOrder=true` (set unconditionally
++	//      below) makes pciAddressAllocator pin each VIF to a fixed PCI
++	//      bus slot per VifOrder — same VM config → same slots every boot.
++	//   2. VyOS's kernel cmdline carries `net.ifnames=0 biosdevname=0`,
++	//      so the kernel uses legacy ethN names assigned by PCI bus order.
++	// We previously emitted `set interfaces ethernet <iface> hw-id '<mac>'`
++	// here as belt-and-suspenders, but VyOS rejects it on bridge members
++	// at commit time ("Cannot assign address to interface as it is a
++	// member of bridge"), which broke first-boot cidata apply. Dropping
++	// hw-id everywhere removes the conflict and the cidata commits cleanly.
+ 
+ 	// WAN interface: DHCP client
+ 	add("set interfaces ethernet " + v.WAN + " description 'WAN'")
+@@ -346,7 +350,8 @@ func main() {
+ 	// (virtio: 0x00:XX.0, passthrough: host PCI addr e.g. 0x02:00.0), so inside the guest
+ 	// Linux names them eth0, eth1, ... ahead of the PCIe NICs.
+ 	// LMP is always placed first (InterfaceOrder=1) so it deterministically gets eth0
+-	// inside the guest, where VyOS renames it to eth100 via hw-id binding.
++	// inside the guest. VyOS does not rename it — `LMPName` is informational only,
++	// kept in the profile for documentation alignment.
+ 	// Other VirtIO NICs (uplink, switch NIs) follow at InterfaceOrder len(pcieAdapters)+2 onward.
+ 	var appInterfaces []*zconfig.NetworkAdapter
+ 
+@@ -369,36 +374,34 @@ func main() {
+ 				},
+ 			},
+ 		})
+-		if vyosCfg != nil {
+-			if vyosCfg.HWIDs == nil {
+-				vyosCfg.HWIDs = make(map[string]string)
+-			}
+-			lmpVyOSName := vyosCfg.LMPName
+-			if lmpVyOSName == "" {
+-				lmpVyOSName = "eth100"
+-			}
+-			vyosCfg.HWIDs[lmpVyOSName] = lmpMAC.String()
+-		}
+ 	}
+ 
+ 	// Non-LMP VirtIO NICs follow after LMP (slot 1) and PCIe slots (2..len+1).
++	// Each VIF gets a deterministic MAC derived from (appUUID, niUUID, adapterNum)
++	// for stable hashing across boots. Kernel-side ethN naming is anchored by
++	// the PCI bus order (set by EnforceNetworkInterfaceOrder) plus VyOS's
++	// `net.ifnames=0 biosdevname=0` kernel cmdline — VyOS does not need any
++	// hw-id directives in its config to track names.
++	// adapterNum allocation:  0 = LMP, 1 = uplink, 2+ = switch NIs (in profile order)
+ 	virtIntfOrder := uint32(len(pcieAdapters) + 2)
+ 
+-	if *uplink != "" {
++	addVIF := func(niUUID string, adapterNum uint8) {
++		vifMAC := vifMACFromUUIDs(uuid.FromStringOrNil(appUUID), uuid.FromStringOrNil(niUUID), adapterNum)
++		ethName := fmt.Sprintf("eth%d", virtIntfOrder-1)
+ 		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+-			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
+-			NetworkId:      natNIUUID,
++			Name:           ethName,
++			NetworkId:      niUUID,
+ 			InterfaceOrder: virtIntfOrder,
++			MacAddress:     vifMAC.String(),
+ 		})
+ 		virtIntfOrder++
+ 	}
+-	for _, sni := range switchNIs {
+-		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+-			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
+-			NetworkId:      sni.niUUID,
+-			InterfaceOrder: virtIntfOrder,
+-		})
+-		virtIntfOrder++
++
++	if *uplink != "" {
++		addVIF(natNIUUID, 1)
++	}
++	for i, sni := range switchNIs {
++		addVIF(sni.niUUID, uint8(i+2))
+ 	}
+ 
+ 	// DeviceIoList: tell EVE about PCIe-assignable adapters.
+@@ -500,15 +503,22 @@ func main() {
+ 				Uuidandversion: &zconfig.UUIDandVersion{Uuid: appUUID, Version: "1"},
+ 				Displayname:    *name,
+ 				Fixedresources: &zconfig.VmConfig{
+-					Memory:                       uint32(*memoryMB * 1024),
+-					Maxmem:                       uint32(*memoryMB * 1024),
+-					Vcpus:                        uint32(*cpus),
+-					Maxcpus:                      uint32(*cpus),
+-					VirtualizationMode:           zconfig.VmMode_HVM,
+-					EnableVnc:                    *enableVNC,
+-					VncDisplay:                   1,
+-					VncPasswd:                    *vncPasswd,
+-					EnforceNetworkInterfaceOrder: len(pcieAdapters) > 0,
++					Memory:             uint32(*memoryMB * 1024),
++					Maxmem:             uint32(*memoryMB * 1024),
++					Vcpus:              uint32(*cpus),
++					Maxcpus:            uint32(*cpus),
++					VirtualizationMode: zconfig.VmMode_HVM,
++					EnableVnc:          *enableVNC,
++					VncDisplay:         1,
++					VncPasswd:          *vncPasswd,
++					// Always enforce interface order so guest-kernel ethN naming is
++					// deterministic across reboots. When this is false, pillar/domainmgr
++					// free-orders the NICs and the LMP can end up at kernel eth1 instead
++					// of eth0 (observed on qemu profile). With it true, pciAddressAllocator
++					// pins each VIF to a PCI bus slot derived from VifOrder, and VyOS's
++					// `net.ifnames=0 biosdevname=0` cmdline ensures kernel names follow
++					// bus order.
++					EnforceNetworkInterfaceOrder: true,
+ 				},
+ 				VolumeRefList: []*zconfig.VolumeRef{
+ 					{Uuid: volUUID, GenerationCount: 0, MountDir: ""},
+@@ -568,22 +578,31 @@ func main() {
+ 	}
+ }
+ 
+-// lmpMACFromUUIDs computes a deterministic MAC address for the LMP virtual NIC.
+-// The MAC is derived from the app and LMP network-instance UUIDs using SHA-256,
+-// matching the OUI (02:16:3E) that EVE uses for switch-NI virtual NICs.
+-// Unlike EVE's runtime MAC generation it does not include the per-device AppNum,
+-// so the result is stable across reinstalls and independent of runtime state.
+-// Setting this MAC explicitly in the NetworkAdapter config causes EVE to use it
+-// instead of its own generated value.
+-func lmpMACFromUUIDs(appUUID, lmpNIUUID uuid.UUID) net.HardwareAddr {
++// vifMACFromUUIDs computes a deterministic MAC address for a virtual NIC
++// attached to the VyOS guest. The MAC is derived from (appUUID, niUUID,
++// adapterNum) using SHA-256, matching the OUI (02:16:3E) that EVE uses for
++// switch-NI virtual NICs. Unlike EVE's runtime MAC generation it does not
++// include the per-device AppNum, so the result is stable across reinstalls
++// and independent of runtime state. Setting this MAC explicitly in the
++// NetworkAdapter config causes EVE to use it instead of generating one.
++//
++// adapterNum disambiguates multiple NICs that share an niUUID and keeps each
++// MAC unique within the same app. By convention 0=LMP, 1=uplink, 2+ = switch
++// NIs in profile order.
++func vifMACFromUUIDs(appUUID, niUUID uuid.UUID, adapterNum uint8) net.HardwareAddr {
+ 	h := sha256.New()
+ 	h.Write(appUUID[:])
+-	h.Write(lmpNIUUID[:])
+-	h.Write([]byte{0}) // adapterNum = 0 (LMP is the only virtual NIC)
++	h.Write(niUUID[:])
++	h.Write([]byte{adapterNum})
+ 	hash := h.Sum(nil)
+ 	return net.HardwareAddr{0x02, 0x16, 0x3e, hash[0], hash[1], hash[2]}
+ }
+ 
++// lmpMACFromUUIDs is a backward-compatible wrapper for the LMP VIF (adapterNum=0).
++func lmpMACFromUUIDs(appUUID, lmpNIUUID uuid.UUID) net.HardwareAddr {
++	return vifMACFromUUIDs(appUUID, lmpNIUUID, 0)
++}
++
+ // splitImageURL splits a full image URL into the datastore base URL and filename.
+ func splitImageURL(rawURL string) (base, file string) {
+ 	for _, scheme := range []string{"https://", "http://"} {
+-- 
+2.51.0
+
