@@ -5,7 +5,7 @@ name: vyos
 
 image:
   url: http://localhost:8888/images/small-vyos-ssh-nat.qcow2
-  sha256: 8eadff0c026eeae26d3d0bcbbae523967af7edbe8f301bd6554a8cee347feafd
+  sha256: 714f111ab8b6b7762112f2de74a20418890ab9b7c4679152f8107b1498922f87
   format: qcow2
   size: 805044224  # bytes
 
@@ -60,10 +60,15 @@ vyos:
   lmp_name: eth0
   lan:
     - eth0
-  lan_subnet: 192.168.1.0/24
-  lan_gateway: 192.168.1.1
-  dhcp_range_start: 192.168.1.100
-  dhcp_range_stop: 192.168.1.200
+  # 192.168.33.0/24 keeps the inner VyOS LAN distinct from the EVE QEMU
+  # outer user-net (192.168.1.0/24, where EVE gets 192.168.1.10 and
+  # 192.168.1.2 is the QEMU NAT host stub). Picking the same /24 caused
+  # VyOS eth0 to either collide with the outer NAT or fall back to DHCP
+  # from it (taking 192.168.1.11) when cloud-init failed to apply.
+  lan_subnet: 192.168.33.0/24
+  lan_gateway: 192.168.33.1
+  dhcp_range_start: 192.168.33.100
+  dhcp_range_stop: 192.168.33.200
   hostname: vyos-qemu
   name_servers:
     - 8.8.8.8
