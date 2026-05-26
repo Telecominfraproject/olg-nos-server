@@ -19,11 +19,35 @@ vm:
 # In QEMU: eth1
 lmp: eth1
 
-# Additional interfaces passed to VyOS (all switch type for QEMU).
+# Management uplink: the EVE-side ethN that hosts EVE's own outbound
+# network (control plane / SSH-from-host / image fetch). In the QEMU
+# profile this is `eth0` (outer QEMU's first user-net, 192.168.1.0/24,
+# with hostfwd 2222→22 to EVE's sshd). Only consulted by gen-loc-config
+# when SystemAdapterList is explicit (i.e. PCIe-passthrough mode); in
+# the default no-passthrough flow NIM auto-discovers it via last-resort.
+mgmt_uplink: eth0
+
+# Additional interfaces passed to VyOS.
 # Interfaces are presented to VyOS in order: eth1, eth2, ...
+# (LMP is always first, so it lands as eth0 inside the guest.)
+#
+# PCIe passthrough requires the outer QEMU to have been launched with
+# matching e1000e devices behind their own pcie-root-ports — i.e.
+# `make run-live E1000E=1`. The PciLong + IOMMU group values come from
+# the EVE host's `lspci -D` and `/sys/kernel/iommu_groups/`.
 interfaces:
   - name: eth0
     type: switch
+  - name: pt_e1k0
+    type: pcie
+    pci: 0000:01:00.0
+    assigngrp: group9
+    mac: '52:54:00:e1:00:00'
+  - name: pt_e1k1
+    type: pcie
+    pci: 0000:02:00.0
+    assigngrp: group10
+    mac: '52:54:00:e1:00:01'
 
 vnc_passwd: "eve"
 

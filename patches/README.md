@@ -24,3 +24,5 @@
 | 0018 | `gen-loc-config` | hw-id binding for every VIF, not just LMP | `pkg/pillar/cmd/gen-loc-config/main.go` |
 | 0019 | `gen-loc-config` | delete baked-in ethernet on LAN bridge members | `pkg/pillar/cmd/gen-loc-config/main.go` |
 | 0020 | `Makefile` | route EVE serial + monitor through unix sockets | `Makefile` |
+| 0021 | `Makefile` | optional E1000E passthrough fixture for QEMU runs | `Makefile` |
+| 0022 | `gen-loc-config` | PCIe passthrough with deterministic ethN naming | `pkg/pillar/cmd/gen-loc-config/main.go` |

@@ -154,12 +154,23 @@ builds; the Docker wrapper is good for the setup-only path only.
 After `./build.sh qemu`, eve's upstream Makefile has the run target wired up:
 
 ```sh
-cd eve && make run-live           # boots live.qcow2 with KVM + swtpm
+cd eve && make E1000E=1 run-live  # boots live.qcow2 with KVM + swtpm
                                   # hostfwd 2222 → guest 22,
                                   # serial on  eve/eve-serial.sock (unix socket)
                                   # monitor on eve/eve-mon.sock    (unix socket)
                                   # QMP     on eve/qmp.sock
 ```
+
+**`E1000E=1` is required.** The `qemu` profile pins two PCIe-passthrough
+NICs (`pt_e1k0` / `pt_e1k1` at `0000:01:00.0` / `0000:02:00.0`) into the
+VyOS guest. Without `E1000E=1`, the outer QEMU launches no e1000e
+devices, EVE's pillar can't bind vfio for them, and the VyOS app
+short-circuits to **`BROKEN`** with `AdaptersFailed=true`,
+`Error="driver_override failure for PCI device 0000:01:00.0:
+no such host device"`. The Makefile's `QEMU_OPTS_e1000e` block in
+the eve patch series exposes two e1000e behind dedicated
+`pcie-root-port`s with MACs `52:54:00:e1:00:00` / `:01` matching the
+profile.
 
 ### Attaching to the EVE serial
 
