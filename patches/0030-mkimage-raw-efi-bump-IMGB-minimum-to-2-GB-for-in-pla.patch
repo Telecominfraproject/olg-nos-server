@@ -1,0 +1,43 @@
+From b78125ced02e107ec42ed2bc2a6dba5101ba1d26 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Thu, 28 May 2026 16:36:25 +0000
+Subject: [PATCH] mkimage-raw-efi: bump IMGB minimum to 2 GB for in-place
+ upgrades
+
+ROOTFS_PART_SIZE_MIN governs the size floor for both IMGA and IMGB.
+IMGB also takes this floor verbatim because ROOTFS_IMG_B is empty
+for non-evaluation kvm builds (see line 134), so the partition is
+allocated as a placeholder for future upgrades.
+
+At the old 512 MB floor, IMGB could not accept a copy of the active
+rootfs (currently ~1.03 GB), forcing every OS upgrade through a USB
+reinstall. Bump the floor to 2 GB so an inactive rootfs of up to 2 GB
+fits without repartitioning, enabling the Fix F SSH dd-to-IMGB upgrade
+flow. Cost on disk: ~3 GB shaved from the persist partition (475 GB ->
+~473 GB).
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/mkimage-raw-efi/make-raw | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/mkimage-raw-efi/make-raw b/pkg/mkimage-raw-efi/make-raw
+index 007ee9848..a39c701c7 100755
+--- a/pkg/mkimage-raw-efi/make-raw
++++ b/pkg/mkimage-raw-efi/make-raw
+@@ -99,7 +99,11 @@ EFI_PART_SIZE=$((36 * 1024 * 1024))
+ # Warning: fixing the EVE upgrade logic, which should find
+ # Warning: free space and rellocate all tables if image has
+ # Warning: been bloated.
+-ROOTFS_PART_SIZE_MIN=$((512 * 1024 * 1024))
++# OLG: bumped from 512 MB to 2 GB so IMGB is pre-sized for in-place
++# A/B rootfs upgrades over SSH (dd new rootfs to inactive part).
++# The current OLG rootfs is ~1.03 GB; 2 GB gives ~2x headroom and
++# costs ~3 GB out of the persist partition.
++ROOTFS_PART_SIZE_MIN=$((2 * 1024 * 1024 * 1024))
+ # For eve-k lets set partition size to 4GB and EFI partition size to 2GB
+ # Check if file /root/etc/eve-hv-type exists.
+ # make-raw will be called twice during compilation and during installation.
+-- 
+2.51.0
+
