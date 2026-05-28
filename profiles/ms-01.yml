@@ -4,12 +4,19 @@
 # Port layout (EVE host):
 #   eth0  10G  0000:02:00.0  group14  -> PCIe passthrough -> VyOS LAN
 #   eth1  10G  0000:02:00.1  group15  -> PCIe passthrough -> VyOS LAN
-#   eth2  2.5G 0000:57:00.0  group16  -> LMP (Switch NI bridge -> VyOS, CPlane)
-#   eth3  2.5G 0000:58:00.0  group17  -> PCIe passthrough -> VyOS WAN
+#   eth2  2.5G 0000:57:00.0  group16  -> PCIe passthrough -> VyOS WAN (i226-V)
+#   eth3  2.5G 0000:58:00.0  group17  -> LMP (Switch NI bridge -> VyOS, CPlane)
+#                                        i226-LM — AMT/vPro-capable, used
+#                                        for out-of-band management.
+#
+# Cable convention on the back panel:
+#   - LMP cable plugs into the i226-LM 2.5G port (eth3 / PCI 0000:58:00.0).
+#   - WAN cable plugs into the i226-V  2.5G port (eth2 / PCI 0000:57:00.0).
+#   - Two SFP+ cages carry the 10G LAN data plane.
 #
 # Interface mapping inside VyOS (PCI enumeration order):
 #   eth0   -> VirtIO LMP NIC (CPlane bridge member, br0)
-#   eth1   -> host eth3  (PCIe 2.5G WAN, 0000:58:00.0)
+#   eth1   -> host eth2  (PCIe 2.5G WAN, 0000:57:00.0, i226-V)
 #   eth2   -> host eth0  (PCIe 10G LAN, 0000:02:00.0)
 #   eth3   -> host eth1  (PCIe 10G LAN, 0000:02:00.1)
 #
@@ -33,23 +40,26 @@ vm:
   vnc: true
 
 # LMP (Local Management Port): bridged to a Switch network instance.
-# eth2 = onboard 2.5G NIC, becomes a member of br0/CPlane inside VyOS.
-lmp: eth2
+# eth3 = onboard 2.5G NIC (i226-LM, PCI 0000:58:00.0); becomes a
+# member of br0/CPlane inside VyOS. The i226-LM variant exposes
+# Intel AMT/vPro, so OOB management (remote KVM, power, SOL) rides
+# this same port — see research-ms01-amt.md for provisioning.
+lmp: eth3
 
 # Management uplink: EVE's own outbound goes through VyOS over the
 # CPlane bridge — there's no separate mgmt NIC on ms-01. Same physical
 # port as `lmp`; EVE's NIM treats bn1 (the LMP Switch NI bridge) as
 # its uplink and reaches the controller via VyOS NAT on br0.
-mgmt_uplink: eth2
+mgmt_uplink: eth3
 
 # PCIe passthrough interfaces — presented to VyOS in PCI order.
 # pci + assigngrp from controller-model.json (installer-generated).
 # Order chosen so VyOS sees WAN at eth1 and the two 10G LAN NICs at eth2/eth3.
 interfaces:
-  - name: eth3
+  - name: eth2
     type: pcie
-    pci: "0000:58:00.0"
-    assigngrp: "group17"
+    pci: "0000:57:00.0"
+    assigngrp: "group16"
   - name: eth0
     type: pcie
     pci: "0000:02:00.0"
@@ -82,7 +92,7 @@ vyos:
 
   # Data-plane LAN bridge (br1). The two onboard 10G NICs.
   # eth2 and eth3 here are INSIDE-VyOS names — eth2 = host eth0
-  # (PCIe 10G), eth3 = host eth1 (PCIe 10G). The LMP port (host eth2
+  # (PCIe 10G), eth3 = host eth1 (PCIe 10G). The LMP port (host eth3
   # / VyOS eth0) is intentionally NOT in this list — it belongs to
   # br0/CPlane.
   lan:
