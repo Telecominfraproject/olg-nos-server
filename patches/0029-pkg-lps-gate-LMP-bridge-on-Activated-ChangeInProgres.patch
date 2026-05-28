@@ -1,0 +1,111 @@
+From 78794b81bfe8964613513b3e9082f1c41bae018a Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Thu, 28 May 2026 15:44:33 +0000
+Subject: [PATCH] pkg/lps: gate LMP bridge on Activated + ChangeInProgress, not
+ bn<N> name
+
+On QEMU the LMP NI's bridge is renamed to bn<N> by nireconciler; on
+hardware (e.g. ms-01) it keeps the port name (e.g. eth2). The bn<N>
+regex worked for the former and silently dropped the latter, leaving
+the LMP bridge without a DHCP lease.
+
+Switch the gate to NI semantics: Activated == true, ChangeInProgress
+== 0, BridgeIfindex assigned, and /sys/class/net/<BridgeName>/bridge
+exists. ChangeInProgress covers the transient eth1-as-bridge race
+that the bn<N> regex was working around -- nireconciler holds CIP=1
+through the create/teardown/rename window, so the gate only releases
+on the final, stable bridge.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/lps/src/lmp.go | 50 ++++++++++++++++++++++++++--------------------
+ 1 file changed, 28 insertions(+), 22 deletions(-)
+
+diff --git a/pkg/lps/src/lmp.go b/pkg/lps/src/lmp.go
+index f75e963b2..27104f343 100644
+--- a/pkg/lps/src/lmp.go
++++ b/pkg/lps/src/lmp.go
+@@ -6,7 +6,6 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+-	"regexp"
+ 	"strings"
+ 	"time"
+ )
+@@ -99,27 +98,28 @@ func LMPBringUp() {
+ }
+ 
+ // waitForLMPBridge polls NetworkInstanceStatus until it finds an NI with
+-// a DisplayName ending in "-lmp" whose BridgeName names a real Linux
+-// bridge under EVE's "bn<N>" convention. Returns the bridge ifname,
+-// or "" on timeout.
++// a DisplayName ending in "-lmp" whose reconciliation has settled.
++// Returns the bridge ifname, or "" on timeout.
+ //
+-// Two filters matter here, and naive checks miss them:
++// Gating semantics (not name): the NI must be Activated, must not be
++// mid-change (ChangeInProgress == 0), must have a kernel-assigned
++// BridgeIfindex, and the BridgeName must resolve to a real Linux
++// bridge under /sys/class/net/<name>/bridge.
+ //
+-//   - bridge-subdir: /sys/class/net/<name>/bridge must exist. eth1 is a
+-//     port netdev with no bridge subdir, so this rejects the obvious
+-//     port-name case.
+-//   - bn<N> prefix: during boot, nireconciler briefly creates a bridge
+-//     literally named "eth1" (ifindex 10), tears it down, and recreates
+-//     it as "bn1" (ifindex 19). A pure /sys/class/net/<name>/bridge
+-//     check passes on that intermediate eth1-bridge. Requiring the
+-//     "bn<N>" naming convention skips the transient form and only acts
+-//     on the final, stable bridge.
++// Why semantics, not name:
+ //
+-// Acting on the intermediate state ran udhcpc against the slirp-backed
+-// eth1 port, picking up 192.168.2.10 from QEMU's NAT DHCP instead of
+-// VyOS on the real LMP bridge.
+-var lmpBridgeNamePattern = regexp.MustCompile(`^bn[0-9]+$`)
+-
++//   - On QEMU the LMP port is a tap, and nireconciler renames the
++//     bridge to "bn<N>" (e.g. "bn1"). An earlier version hard-coded a
++//     "^bn[0-9]+$" regex which worked there.
++//   - On hardware (e.g. ms-01) the LMP port is a real Ethernet device
++//     and the bridge keeps the port name (e.g. "eth2"). The bn<N>
++//     regex rejected those, leaving the bridge without a DHCP lease.
++//
++// The transient-eth1-bridge race that motivated the bn<N> regex is now
++// covered by ChangeInProgress: during the brief window where
++// nireconciler creates and tears down an "eth1"-named bridge,
++// ChangeInProgress stays 1 — the gate doesn't release until the final,
++// stable bridge is in place.
+ func waitForLMPBridge(timeout time.Duration) string {
+ 	const dir = "/run/zedrouter/NetworkInstanceStatus"
+ 	deadline := time.Now().Add(timeout)
+@@ -134,8 +134,11 @@ func waitForLMPBridge(timeout time.Duration) string {
+ 				continue
+ 			}
+ 			var ni struct {
+-				DisplayName string
+-				BridgeName  string
++				DisplayName      string
++				BridgeName       string
++				BridgeIfindex    int
++				Activated        bool
++				ChangeInProgress int
+ 			}
+ 			if err := json.Unmarshal(data, &ni); err != nil {
+ 				continue
+@@ -143,7 +146,10 @@ func waitForLMPBridge(timeout time.Duration) string {
+ 			if !strings.HasSuffix(ni.DisplayName, "-lmp") {
+ 				continue
+ 			}
+-			if !lmpBridgeNamePattern.MatchString(ni.BridgeName) {
++			if !ni.Activated || ni.ChangeInProgress != 0 {
++				continue
++			}
++			if ni.BridgeIfindex == 0 || ni.BridgeName == "" {
+ 				continue
+ 			}
+ 			if _, err := os.Stat("/sys/class/net/" + ni.BridgeName + "/bridge"); err == nil {
+-- 
+2.51.0
+
