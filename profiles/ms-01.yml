@@ -2,25 +2,30 @@
 # Used by gen-loc-config to generate conf/lps/loc-config.bin
 #
 # Port layout (EVE host):
-#   eth0  10G  0000:02:00.0  group14  -> PCIe passthrough -> VyOS
-#   eth1  10G  0000:02:00.1  group15  -> PCIe passthrough -> VyOS
-#   eth2  2.5G 0000:57:00.0  group16  -> LMP (Switch NI bridge -> VyOS)
-#   eth3  2.5G 0000:58:00.0  group17  -> PCIe passthrough -> VyOS (WAN)
+#   eth0  10G  0000:02:00.0  group14  -> PCIe passthrough -> VyOS LAN
+#   eth1  10G  0000:02:00.1  group15  -> PCIe passthrough -> VyOS LAN
+#   eth2  2.5G 0000:57:00.0  group16  -> LMP (Switch NI bridge -> VyOS, CPlane)
+#   eth3  2.5G 0000:58:00.0  group17  -> PCIe passthrough -> VyOS WAN
 #
 # Interface mapping inside VyOS (PCI enumeration order):
-#   eth0   -> VirtIO LMP NIC (lowest PCI addr 0x00:xx.0), renamed to eth100 via hw-id
-#   eth1   -> host eth3  (PCIe 2.5G WAN, PCI 0000:58:00.0) — first in interfaces list
-#   eth2   -> host eth0  (PCIe 10G LAN, PCI 0000:02:00.0)
-#   eth3   -> host eth1  (PCIe 10G LAN, PCI 0000:02:00.1)
-#   eth100 -> eth0 after udev rename via hw-id binding
+#   eth0   -> VirtIO LMP NIC (CPlane bridge member, br0)
+#   eth1   -> host eth3  (PCIe 2.5G WAN, 0000:58:00.0)
+#   eth2   -> host eth0  (PCIe 10G LAN, 0000:02:00.0)
+#   eth3   -> host eth1  (PCIe 10G LAN, 0000:02:00.1)
+#
+# Two-bridge design (matches qemu profile):
+#   br0 = CPlane bridge: LMP VIF (eth0) only. EVE's udhcpc gets the
+#         static-mapping lease 192.168.33.2 here; VyOS-side gw 192.168.33.1.
+#   br1 = LAN bridge: data-plane PCIe ports (eth2, eth3) for downstream
+#         clients. Independent subnet from CPlane.
 
 name: vyos
 
 image:
   url: http://localhost:8888/images/small-vyos-ssh-nat.qcow2
-  sha256: 2a61b7368554a99bcfd8ad13c0e5c696f56a9c8645687b1d5fc29ac17897269a
+  sha256: 9c366e944206e5c04b5b8e67f297a2c1dce0a5d4d45a7773060230ab8c3a12fd
   format: qcow2
-  size: 744620032  # bytes
+  size: 805175296  # bytes
 
 vm:
   memory_mb: 24576
@@ -28,12 +33,18 @@ vm:
   vnc: true
 
 # LMP (Local Management Port): bridged to a Switch network instance.
-# VyOS gets a virtual NIC on this L2 bridge as the last interface inside the VM.
-# eth2 = second 2.5G NIC, connected to management LAN.
+# eth2 = onboard 2.5G NIC, becomes a member of br0/CPlane inside VyOS.
 lmp: eth2
 
-# PCIe passthrough interfaces — presented to VyOS in order.
-# pci and assigngrp from controller-model.json (installer-generated).
+# Management uplink: EVE's own outbound goes through VyOS over the
+# CPlane bridge — there's no separate mgmt NIC on ms-01. Same physical
+# port as `lmp`; EVE's NIM treats bn1 (the LMP Switch NI bridge) as
+# its uplink and reaches the controller via VyOS NAT on br0.
+mgmt_uplink: eth2
+
+# PCIe passthrough interfaces — presented to VyOS in PCI order.
+# pci + assigngrp from controller-model.json (installer-generated).
+# Order chosen so VyOS sees WAN at eth1 and the two 10G LAN NICs at eth2/eth3.
 interfaces:
   - name: eth3
     type: pcie
@@ -54,19 +65,29 @@ ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKFz5k4h6F0KEKmxygyHTfNY+eJuHr3Ken
 
 output: conf/lps/loc-config.bin
 
-# VyOS cloud-init configuration.
-# wan/lan names refer to interfaces INSIDE the VM (see mapping at top of file).
-# gen-loc-config emits a hw-id binding only for eth100 (computed from app+NI UUIDs)
-# and deliberately deletes the hw-id of the WAN interface so that VyOS does not
-# MAC-lock eth0 to whatever NIC happened to be eth0 at cloud-init time, which
-# would conflict with the eth100 hw-id renaming of the VirtIO NIC.
 vyos:
-  lmp_name: eth0
   wan: eth1
+  lmp_name: eth0
+
+  # Control-plane bridge (br0). LMP VIF only. EVE's udhcpc lands here
+  # and gets the static lease below; future NATS bus binds here.
+  # Same 192.168.33.0/24 as the qemu profile so the EVE-side client-id
+  # (pkg/lps/lmp.go RFC 4361 DUID-EN) doesn't need per-profile tuning.
+  cplane:
+    subnet: 192.168.33.0/24
+    gateway: 192.168.33.1
+    dhcp_range_start: 192.168.33.100
+    dhcp_range_stop: 192.168.33.200
+    eve_lmp_ip: 192.168.33.2
+
+  # Data-plane LAN bridge (br1). The two onboard 10G NICs.
+  # eth2 and eth3 here are INSIDE-VyOS names — eth2 = host eth0
+  # (PCIe 10G), eth3 = host eth1 (PCIe 10G). The LMP port (host eth2
+  # / VyOS eth0) is intentionally NOT in this list — it belongs to
+  # br0/CPlane.
   lan:
     - eth2
     - eth3
-    - eth0
   lan_subnet: 192.168.1.0/24
   lan_gateway: 192.168.1.1
   dhcp_range_start: 192.168.1.100
