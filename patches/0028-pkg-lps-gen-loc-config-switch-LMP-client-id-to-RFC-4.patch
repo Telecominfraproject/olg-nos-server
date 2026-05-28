@@ -1,0 +1,136 @@
+From 871a18c7def32f2005a7dbc30e043cc476190206 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Thu, 28 May 2026 06:03:41 +0000
+Subject: [PATCH] pkg/lps + gen-loc-config: switch LMP client-id to RFC 4361
+ DUID-EN
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The previous "0x00 + olg-eve" client-id was a plain DHCPv4 option-61
+arbitrary-string value, not a DUID. kea-dhcp4 only matches a
+static-mapping 'duid' reservation against incoming option 61 if the
+client wraps the payload in RFC 4361 framing (0xFF marker, 4-byte
+IAID, then the DUID). Without that, kea treats the cid as a generic
+client-id, looks for a 'client-id' reservation, finds none (VyOS
+doesn't expose that key), and falls back to pool allocation. EVE was
+landing on 192.168.33.100 instead of the configured 192.168.33.2.
+
+Switch to a DUID-EN identifier wrapped in RFC 4361:
+- LMPClientIDHex (pkg/lps): full 18-byte option-61 payload sent by
+  udhcpc -x 0x3d:<hex>.
+- gen-loc-config emits the matching reservation duid (DUID portion
+  only — kea strips the 0xFF + IAID prefix before matching).
+
+The two values must stay in sync; LMPDUIDHex exposes the DUID-only
+form so gen-loc-config can be re-pointed at it once the constant
+lives in a shared package both sides can import.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/lps/src/lmp.go                    | 31 ++++++++++++++++++----
+ pkg/pillar/cmd/gen-loc-config/main.go | 38 +++++++++++++--------------
+ 2 files changed, 44 insertions(+), 25 deletions(-)
+
+diff --git a/pkg/lps/src/lmp.go b/pkg/lps/src/lmp.go
+index d69eea6a2..f75e963b2 100644
+--- a/pkg/lps/src/lmp.go
++++ b/pkg/lps/src/lmp.go
+@@ -12,11 +12,32 @@ import (
+ )
+ 
+ // LMPClientIDHex is the DHCP option 61 (client-identifier) value EVE sends
+-// on the LMP bridge. Byte 0x00 is the "no hardware type, ASCII identifier"
+-// form; the remaining bytes are the ASCII string "olg-eve". The upstream
+-// VyOS DHCP server is configured (by gen-loc-config) with a matching
+-// static-mapping identifier so EVE always receives a deterministic IP.
+-const LMPClientIDHex = "006f6c672d657665"
++// on the LMP bridge. RFC 4361 wire format so kea-dhcp4 matches it against
++// the VyOS static-mapping `duid` reservation:
++//
++//	ff                          option-61 type byte: RFC 4361 client-id
++//	00 00 00 01                 IAID (arbitrary; we use 1)
++//	00 02                       DUID type: DUID-EN (vendor enterprise)
++//	00 00 00 00                 IANA enterprise number (placeholder 0)
++//	6f 6c 67 2d 65 76 65        ASCII "olg-eve"
++//
++// kea strips the 0xFF + IAID prefix, then matches the DUID portion
++// (everything after the IAID, i.e. "00:02:00:00:00:00:6f:6c:67:2d:65:76:65")
++// against the reservation's `duid` field. Keep [[LMPDUIDHex]] in
++// gen-loc-config in sync — that's the value emitted into the cidata.
++//
++// Earlier the cid was just "00 olg-eve" (DHCP type=0=arbitrary), which
++// kea treats as a plain client-id, not a DUID, and ignores against `duid`
++// reservations. The reservation matched no client and EVE landed on a
++// pool address instead of the configured static IP.
++const LMPClientIDHex = "ff000000010002000000006f6c672d657665"
++
++// LMPDUIDHex is the DUID portion of [[LMPClientIDHex]] — i.e. everything
++// after the 0xFF marker and the 4-byte IAID. gen-loc-config emits this
++// as the value for `set service dhcp-server ... static-mapping eve duid
++// '<colon-separated>'`. Exported so tests / gen-loc-config import a
++// single source of truth.
++const LMPDUIDHex = "0002000000006f6c672d657665"
+ 
+ // LMPBringUp watches /run/zedrouter/NetworkInstanceStatus/*.json for a
+ // network instance whose DisplayName ends in "-lmp", waits for its bridge
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index ca2dd9746..f2b22154c 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -80,13 +80,12 @@ type CPlaneConfig struct {
+ 	DHCPStop  string `yaml:"dhcp_range_stop"`  // last dynamic-pool address
+ 	// EveLMPIP is the deterministic IP VyOS's DHCP server hands out to the
+ 	// EVE-side udhcpc client running on the LMP bridge (see pkg/lps/lmp.go).
+-	// When set, a `static-mapping eve identifier '00:6f:6c:67:2d:65:76:65'`
+-	// is emitted so EVE always receives this address. The identifier value
+-	// (DHCP option 61) is "olg-eve" prefixed with the 0x00 "no hardware
+-	// type" byte — must stay in sync with LMPClientIDHex in pkg/lps/lmp.go.
+-	// Leave unset to fall back to dynamic-range DHCP (any IP from the
+-	// configured pool); ucentral-client then has to discover the bind
+-	// address at runtime instead of treating it as a known constant.
++	// When set, a `static-mapping eve duid '<lmpDUID>'` is emitted so EVE
++	// always receives this address. The DUID value must match the
++	// RFC 4361 DUID portion of LMPClientIDHex in pkg/lps/lmp.go (see
++	// lmpDUID below for the exact bytes). Leave unset to fall back to
++	// dynamic-range DHCP (any IP from the configured pool); ucentral-client
++	// then has to discover the bind address at runtime.
+ 	EveLMPIP string `yaml:"eve_lmp_ip"`
+ }
+ 
+@@ -280,20 +279,19 @@ func generateVyOSUserData(vyosCfg *VyOSConfig) string {
+ 			add(p + " range 0 start '" + b.dhcpStart + "'")
+ 			add(p + " range 0 stop '" + b.dhcpStop + "'")
+ 
+-			// Static mapping for the EVE-side LMP DHCP client. The identifier
+-			// (DHCP option 61) is "olg-eve" prefixed with 0x00 — see
+-			// pkg/lps/lmp.go LMPClientIDHex for the matching client-id udhcpc
+-			// sends. Lets ucentral-client's NATS bind address be a known
+-			// constant instead of "whichever IP the pool happens to lease".
++			// Static mapping for the EVE-side LMP DHCP client. Lets
++			// ucentral-client's NATS bind address be a known constant
++			// instead of "whichever IP the pool happens to lease".
++			//
++			// VyOS 1.5 dhcp-server static-mapping uses `duid` (or `mac`),
++			// not `identifier` — see dhcp-server-common-config.xml.i in
++			// vyos-1x. The `duid` value must match the RFC 4361 DUID
++			// PORTION of EVE's client-id (everything after the 0xFF
++			// marker and 4-byte IAID), not the full option-61 bytes.
++			// Source of truth for both halves lives in pkg/lps/src/lmp.go
++			// (LMPClientIDHex + LMPDUIDHex); this string mirrors that.
+ 			if b.eveLMPStaticIP != "" {
+-				// VyOS 1.5 dhcp-server static-mapping uses `duid` (or `mac`),
+-				// not `identifier` — see dhcp-server-common-config.xml.i in
+-				// vyos-1x. Committing `identifier '...'` fails with
+-				// "Either MAC address or Client identifier (DUID) is required
+-				// for static mapping". Our DUID is 0x00 + ASCII "olg-eve" =
+-				// 7 bytes; the matching client-id is in pkg/lps/lmp.go
+-				// LMPClientIDHex.
+-				add(p + " static-mapping eve duid '00:6f:6c:67:2d:65:76:65'")
++				add(p + " static-mapping eve duid '00:02:00:00:00:00:6f:6c:67:2d:65:76:65'")
+ 				add(p + " static-mapping eve ip-address '" + b.eveLMPStaticIP + "'")
+ 			}
+ 		}
+-- 
+2.51.0
+

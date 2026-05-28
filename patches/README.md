@@ -26,3 +26,9 @@
 | 0020 | `Makefile` | route EVE serial + monitor through unix sockets | `Makefile` |
 | 0021 | `Makefile` | optional E1000E passthrough fixture for QEMU runs | `Makefile` |
 | 0022 | `gen-loc-config` | PCIe passthrough with deterministic ethN naming | `pkg/pillar/cmd/gen-loc-config/main.go` |
+| 0023 | `Makefile` | add slirp-backed E1000E for VyOS WAN testing | `Makefile` |
+| 0024 | `pkg/lps` | bring up LMP bridge with deterministic DHCP client-id | `pkg/lps/build.yml`, `pkg/lps/src/lmp.go`, `pkg/lps/src/main.go` |
+| 0025 | `gen-loc-config` | split LMP cplane from data-plane LAN bridges | `pkg/pillar/cmd/gen-loc-config/main.go` |
+| 0026 | `pkg/lps` | gitignore the bundled VyOS qcow2 so linuxkit doesn't tag dirty | `pkg/lps/.gitignore` |
+| 0027 | `Makefile` | drop slirp from LMP eth1, use isolated mcast socket | `Makefile` |
+| 0028 | `` | pkg/lps + gen-loc-config: switch LMP client-id to RFC 4361 DUID-EN | `pkg/lps/src/lmp.go`, `pkg/pillar/cmd/gen-loc-config/main.go` |

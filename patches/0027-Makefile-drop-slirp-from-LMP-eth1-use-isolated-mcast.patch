@@ -1,0 +1,48 @@
+From 2761bad776e99df0fb45d2ba2a924fe80486c1f9 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 27 May 2026 16:37:11 +0000
+Subject: [PATCH] Makefile: drop slirp from LMP eth1, use isolated mcast socket
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The default QEMU_OPTS_eth1 used '-netdev user' (slirp), whose
+built-in DHCP server (192.168.2.2) raced VyOS's DHCP reply on the
+LMP bridge. EVE's udhcpc would land 192.168.2.10 from slirp instead
+of the static-mapping VyOS would have served.
+
+eth1 is the LMP port — EVE bridges it with the VyOS VIF and only
+needs an L2 path, not a routable WAN. Switch to a multicast-socket
+netdev on an arbitrary group nothing else is on; no DHCP server,
+no slirp, no race. Also flip to e1000e to match what real hardware
+LMP ports look like.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ Makefile | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index c414db5a0..15b65f66c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -315,7 +315,15 @@ QEMU_OPTS_TPM=$(QEMU_OPTS_TPM_$(TPM:%=Y)_$(ZARCH))
+ ifneq ($(TAP),)
+ QEMU_OPTS_eth1=-netdev tap,id=eth1,ifname=$(TAP),script="" -device virtio-net-pci,netdev=eth1,csum=off,guest_csum=off,romfile=""
+ else
+-QEMU_OPTS_eth1=-netdev user,id=eth1,net=$(IPS_NET2),dhcpstart=$(IPS_NET2_FIRST_IP) -device virtio-net-pci,netdev=eth1,romfile=""
++# eth1 is the LMP port. EVE bridges it with the VyOS VIF in a Switch NI
++# so VyOS's DHCP server (running on its eth0 inside the nested VM) is the
++# only DHCP server EVE's udhcpc on the LMP bridge can reach. The old
++# "-netdev user" default ran slirp's built-in DHCP server on this link,
++# racing VyOS's reply and assigning EVE a 192.168.2.x slirp lease instead
++# of the static-mapping VyOS would have served. Multicast-socket gives
++# us an isolated, DHCP-free point-to-point on an arbitrary group nothing
++# else is on, so the only DHCP server reachable from bn1 is VyOS.
++QEMU_OPTS_eth1=-netdev socket,id=eth1,mcast=230.0.0.1:5500 -device e1000e,netdev=eth1,romfile=""
+ endif
+ 
+ # Three e1000e NICs each behind a dedicated pcie-root-port for IOMMU isolation,
+-- 
+2.51.0
+

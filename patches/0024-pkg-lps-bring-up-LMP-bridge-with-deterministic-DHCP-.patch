@@ -1,0 +1,215 @@
+From 51920ccc7df34d2d33b600bcec173f58474b47a5 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 27 May 2026 11:02:56 +0000
+Subject: [PATCH] pkg/lps: bring up LMP bridge with deterministic DHCP
+ client-id
+
+Adds a goroutine that polls /run/zedrouter/NetworkInstanceStatus until
+it sees a NI whose DisplayName ends in "-lmp", waits for its
+nireconciler-allocated bridge interface to appear, then runs udhcpc
+once with DHCP option 61 (client-id) set to byte 0x00 + ASCII
+"olg-eve". The upstream VyOS DHCP server is configured (by
+gen-loc-config) with a matching static-mapping so EVE always receives
+the same address on the LMP bridge.
+
+This is the interim fix for the LMP bridge having no host-side IP at
+boot. gen-loc-config emits the LMP port as a Switch-NI bridge member
+with Uplink=false and no NetworkUUID, so NIM doesn't bring up a DHCP
+client on the bridge. The proper fix is parseconfig.go gaining
+NetworkInstance-bridge resolution for SystemAdapter.LowerLayerName;
+this helper lets development continue without that change first.
+
+Living in pkg/lps is intentional but temporary: LPS already ships on
+EVE and is on the retirement path (UCENTRAL_INTEGRATION decision #12).
+When the ucentral EVE sub-agent takes over loc-config.bin, this
+responsibility moves there too.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/lps/build.yml   |   5 ++
+ pkg/lps/src/lmp.go  | 136 ++++++++++++++++++++++++++++++++++++++++++++
+ pkg/lps/src/main.go |   5 ++
+ 3 files changed, 146 insertions(+)
+ create mode 100644 pkg/lps/src/lmp.go
+
+diff --git a/pkg/lps/build.yml b/pkg/lps/build.yml
+index 097acaa70..946d6d6af 100644
+--- a/pkg/lps/build.yml
++++ b/pkg/lps/build.yml
+@@ -4,10 +4,15 @@ config:
+   # The LPS server needs access to:
+   # - /config/lps: read token, profile, radio_silence, dev_command, app_commands/
+   # - /persist/lps: write state files (last_location.json, etc.)
++  # - /run/zedrouter: read-only view of NetworkInstanceStatus so the
++  #   LMP bring-up goroutine (lmp.go) can find the LMP bridge name.
+   # - host network: LPS listens on port 8888 and EVE connects to it directly
+   binds:
+     - /config:/config:ro
+     - /persist/lps:/persist/lps
++    - /run/zedrouter:/run/zedrouter:ro
+   capabilities:
+     - CAP_NET_BIND_SERVICE  # bind to port 8888
++    - CAP_NET_RAW           # udhcpc opens a raw socket on the LMP bridge
++    - CAP_NET_ADMIN         # udhcpc configures address/route on the LMP bridge
+   net: host
+diff --git a/pkg/lps/src/lmp.go b/pkg/lps/src/lmp.go
+new file mode 100644
+index 000000000..d69eea6a2
+--- /dev/null
++++ b/pkg/lps/src/lmp.go
+@@ -0,0 +1,136 @@
++package main
++
++import (
++	"encoding/json"
++	"log"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"time"
++)
++
++// LMPClientIDHex is the DHCP option 61 (client-identifier) value EVE sends
++// on the LMP bridge. Byte 0x00 is the "no hardware type, ASCII identifier"
++// form; the remaining bytes are the ASCII string "olg-eve". The upstream
++// VyOS DHCP server is configured (by gen-loc-config) with a matching
++// static-mapping identifier so EVE always receives a deterministic IP.
++const LMPClientIDHex = "006f6c672d657665"
++
++// LMPBringUp watches /run/zedrouter/NetworkInstanceStatus/*.json for a
++// network instance whose DisplayName ends in "-lmp", waits for its bridge
++// interface to appear in /sys/class/net, then runs udhcpc once with our
++// deterministic client-id.
++//
++// Background: gen-loc-config emits the LMP port as a Switch-NI bridge
++// member with Uplink=false and no NetworkUUID, so NIM doesn't bring up
++// a DHCP client on the bridge. The proper fix is to teach NIM that a
++// SystemAdapter can target a NetworkInstance bridge directly (see
++// parseconfig.go:1351-1365 LowerLayerName resolution). Until that lands,
++// this helper plugs the gap so the bridge gets an IP at boot.
++//
++// This intentionally lives in pkg/lps for now: LPS already runs on EVE,
++// already ships in pillar-side builds, and is on the retirement path
++// per UCENTRAL_INTEGRATION.md decision #12 — when the ucentral EVE
++// sub-agent takes over loc-config.bin generation, the LMP bring-up
++// responsibility moves there too.
++func LMPBringUp() {
++	bridge := waitForLMPBridge(5 * time.Minute)
++	if bridge == "" {
++		return
++	}
++	// udhcpc args:
++	//   -i bridge       : interface to DHCP on
++	//   -n              : exit if no lease (don't loop forever in this udhcpc)
++	//   -q              : exit after lease obtained (don't background)
++	//   -t 10 -T 3      : 10 DISCOVER tries, 3s apart (~30s per attempt)
++	//   -V olg-eve      : DHCP option 60 (vendor class id), informational
++	//   -x 0x3d:<hex>   : DHCP option 61 (client-id) — matches static-mapping
++	//
++	// Outer retry loop: VyOS's cloud-init runs cc_vyos_userdata + the runcmd
++	// commit AFTER cloud-init.service starts kea — but cc_vyos_userdata races
++	// kea's startup, so the first udhcpc at LPS boot routinely lands while
++	// kea is still being reconfigured and gets no OFFER. Retry every 30s up
++	// to ~10 minutes; once we have a lease we return and leave the
++	// interface configured.
++	deadline := time.Now().Add(10 * time.Minute)
++	attempt := 0
++	for time.Now().Before(deadline) {
++		attempt++
++		log.Printf("lmp-up: udhcpc attempt %d on %s", attempt, bridge)
++		cmd := exec.Command("udhcpc",
++			"-i", bridge,
++			"-n", "-q",
++			"-t", "10", "-T", "3",
++			"-V", "olg-eve",
++			"-x", "0x3d:"+LMPClientIDHex,
++		)
++		out, err := cmd.CombinedOutput()
++		if err == nil {
++			log.Printf("lmp-up: udhcpc on %s done\noutput:\n%s", bridge, out)
++			return
++		}
++		log.Printf("lmp-up: udhcpc attempt %d failed on %s: %v\noutput:\n%s", attempt, bridge, err, out)
++		time.Sleep(30 * time.Second)
++	}
++	log.Printf("lmp-up: gave up after %d attempts; bn1 left without a lease", attempt)
++}
++
++// waitForLMPBridge polls NetworkInstanceStatus until it finds an NI with
++// a DisplayName ending in "-lmp" whose BridgeName names a real Linux
++// bridge under EVE's "bn<N>" convention. Returns the bridge ifname,
++// or "" on timeout.
++//
++// Two filters matter here, and naive checks miss them:
++//
++//   - bridge-subdir: /sys/class/net/<name>/bridge must exist. eth1 is a
++//     port netdev with no bridge subdir, so this rejects the obvious
++//     port-name case.
++//   - bn<N> prefix: during boot, nireconciler briefly creates a bridge
++//     literally named "eth1" (ifindex 10), tears it down, and recreates
++//     it as "bn1" (ifindex 19). A pure /sys/class/net/<name>/bridge
++//     check passes on that intermediate eth1-bridge. Requiring the
++//     "bn<N>" naming convention skips the transient form and only acts
++//     on the final, stable bridge.
++//
++// Acting on the intermediate state ran udhcpc against the slirp-backed
++// eth1 port, picking up 192.168.2.10 from QEMU's NAT DHCP instead of
++// VyOS on the real LMP bridge.
++var lmpBridgeNamePattern = regexp.MustCompile(`^bn[0-9]+$`)
++
++func waitForLMPBridge(timeout time.Duration) string {
++	const dir = "/run/zedrouter/NetworkInstanceStatus"
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		entries, _ := os.ReadDir(dir)
++		for _, e := range entries {
++			if !strings.HasSuffix(e.Name(), ".json") {
++				continue
++			}
++			data, err := os.ReadFile(filepath.Join(dir, e.Name()))
++			if err != nil {
++				continue
++			}
++			var ni struct {
++				DisplayName string
++				BridgeName  string
++			}
++			if err := json.Unmarshal(data, &ni); err != nil {
++				continue
++			}
++			if !strings.HasSuffix(ni.DisplayName, "-lmp") {
++				continue
++			}
++			if !lmpBridgeNamePattern.MatchString(ni.BridgeName) {
++				continue
++			}
++			if _, err := os.Stat("/sys/class/net/" + ni.BridgeName + "/bridge"); err == nil {
++				return ni.BridgeName
++			}
++		}
++		time.Sleep(3 * time.Second)
++	}
++	log.Printf("lmp-up: timed out waiting for LMP bridge after %s", timeout)
++	return ""
++}
+diff --git a/pkg/lps/src/main.go b/pkg/lps/src/main.go
+index e3dbd068a..a47bb6349 100644
+--- a/pkg/lps/src/main.go
++++ b/pkg/lps/src/main.go
+@@ -639,6 +639,11 @@ func main() {
+ 	// LOC compound-config endpoint: /api/v2/edgedevice/id/{uuid}/compound-config
+ 	mux.HandleFunc("/api/v2/edgedevice/", srv.handleCompoundConfig)
+ 
++	// Background goroutine: bring up the LMP bridge with a DHCP client
++	// (see lmp.go). Off-band from NIM until parseconfig.go grows native
++	// NI-bridge support.
++	go LMPBringUp()
++
+ 	addr := fmt.Sprintf(":%s", *port)
+ 	log.Printf("EVE LPS server starting on %s", addr)
+ 	log.Printf("  config dir : %s", *configDir)
+-- 
+2.51.0
+

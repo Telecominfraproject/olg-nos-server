@@ -1,0 +1,297 @@
+From 20e2fc97125bffe7c2bf4fbdbf6945eb3ac738a0 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 27 May 2026 11:04:51 +0000
+Subject: [PATCH] gen-loc-config: split LMP cplane from data-plane LAN bridges
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Refactors the VyOS cloud-init bridge emission into a single helper
+that's called twice — once for the control-plane bridge (brcp,
+LMP VIF only) and once for the data-plane LAN bridge (brlan, PCIe
+LAN ports). Each bridge gets its own subnet, DHCP server scope,
+NAT-source rule (100 and 101), and DNS-forwarding listen address.
+Both NAT-masquerade through the WAN.
+
+Profile schema gains a `vyos.cplane` sub-block (subnet, gateway,
+dhcp range, eve_lmp_ip); the existing `vyos.lan` and lan_* flat
+fields now configure the data-plane bridge only. Profiles that
+don't need a data plane (e.g. QEMU) set `lan: []` and skip brlan.
+
+The eve_lmp_ip static-mapping uses DHCP option 61 identifier
+"00:olg-eve" — must stay in sync with LMPClientIDHex in
+pkg/lps/lmp.go. Keeping NATS-bus chatter and SSH access on their
+own broadcast domain (separate from downstream LAN clients) is
+the motivation for the split.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 223 ++++++++++++++++++++------
+ 1 file changed, 174 insertions(+), 49 deletions(-)
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index 4952341a0..ca2dd9746 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -67,20 +67,44 @@ type ProfileInterface struct {
+ 	Mac string `yaml:"mac"`
+ }
+ 
++// CPlaneConfig describes the control-plane bridge — a separate L2/L3
++// broadcast domain dedicated to EVE↔VyOS management traffic (SSH,
++// future NATS bus). The LMP VIF is the only bridge member. Keeping
++// cplane separate from the data-plane LAN bridge prevents NATS /
++// management chatter from leaking onto downstream LAN ports and
++// vice-versa.
++type CPlaneConfig struct {
++	Subnet    string `yaml:"subnet"`           // CIDR, e.g. "192.168.33.0/24"
++	Gateway   string `yaml:"gateway"`          // VyOS-side bridge IP, e.g. "192.168.33.1"
++	DHCPStart string `yaml:"dhcp_range_start"` // first dynamic-pool address
++	DHCPStop  string `yaml:"dhcp_range_stop"`  // last dynamic-pool address
++	// EveLMPIP is the deterministic IP VyOS's DHCP server hands out to the
++	// EVE-side udhcpc client running on the LMP bridge (see pkg/lps/lmp.go).
++	// When set, a `static-mapping eve identifier '00:6f:6c:67:2d:65:76:65'`
++	// is emitted so EVE always receives this address. The identifier value
++	// (DHCP option 61) is "olg-eve" prefixed with the 0x00 "no hardware
++	// type" byte — must stay in sync with LMPClientIDHex in pkg/lps/lmp.go.
++	// Leave unset to fall back to dynamic-range DHCP (any IP from the
++	// configured pool); ucentral-client then has to discover the bind
++	// address at runtime instead of treating it as a known constant.
++	EveLMPIP string `yaml:"eve_lmp_ip"`
++}
++
+ // VyOSConfig describes the VyOS networking to configure via cloud-init.
+ // Interface names (WAN, LAN) refer to interfaces as seen INSIDE the VM
+ // after EVE's EnforceNetworkInterfaceOrder assigns PCI slots.
+ type VyOSConfig struct {
+-	WAN         string   `yaml:"wan"`              // WAN interface name inside VM (gets DHCP)
+-	LAN         []string `yaml:"lan"`              // LAN interface names inside VM
+-	LANSubnet   string   `yaml:"lan_subnet"`       // e.g. "192.168.1.0/24"
+-	LANGateway  string   `yaml:"lan_gateway"`      // e.g. "192.168.1.1"
+-	DHCPStart   string   `yaml:"dhcp_range_start"` // e.g. "192.168.1.100"
+-	DHCPStop    string   `yaml:"dhcp_range_stop"`  // e.g. "192.168.1.200"
+-	Hostname    string   `yaml:"hostname"`
+-	NameServers []string `yaml:"name_servers"` // DNS servers pushed to DHCP clients
+-	CIOutput    string   `yaml:"ci_output"`    // output path for the cloud-init ISO
+-	Commands    []string `yaml:"commands"`     // additional VyOS set commands appended last
++	WAN         string       `yaml:"wan"`              // WAN interface name inside VM (gets DHCP)
++	LAN         []string     `yaml:"lan"`              // Data-plane LAN interface names inside VM (PCIe LAN ports)
++	LANSubnet   string       `yaml:"lan_subnet"`       // Data-plane LAN bridge CIDR (only used when LAN is non-empty)
++	LANGateway  string       `yaml:"lan_gateway"`      // Data-plane LAN bridge VyOS-side IP
++	DHCPStart   string       `yaml:"dhcp_range_start"` // Data-plane LAN DHCP pool start
++	DHCPStop    string       `yaml:"dhcp_range_stop"`  // Data-plane LAN DHCP pool stop
++	CPlane      CPlaneConfig `yaml:"cplane"`           // Control-plane bridge (LMP VIF only)
++	Hostname    string       `yaml:"hostname"`
++	NameServers []string     `yaml:"name_servers"` // DNS servers pushed to DHCP clients on both bridges
++	CIOutput    string       `yaml:"ci_output"`    // output path for the cloud-init ISO
++	Commands    []string     `yaml:"commands"`     // additional VyOS set commands appended last
+ 	// LMPName is the interface name VyOS will use for the LMP virtio NIC.
+ 	// Kernel-side ethN naming is determined by PCI bus order (anchored by
+ 	// EVE's EnforceNetworkInterfaceOrder) plus VyOS's `net.ifnames=0
+@@ -203,63 +227,164 @@ func generateVyOSUserData(vyosCfg *VyOSConfig) string {
+ 	add("set interfaces ethernet " + v.WAN + " description 'WAN'")
+ 	add("set interfaces ethernet " + v.WAN + " address 'dhcp'")
+ 
+-	if len(v.LAN) > 0 && v.LANSubnet != "" && v.LANGateway != "" {
+-		_, ipNet, err := net.ParseCIDR(v.LANSubnet)
++	type bridgeSpec struct {
++		brName         string   // VyOS bridge name (brcp / brlan / ...)
++		desc           string   // description shown in VyOS config
++		members        []string // VyOS-side ethN names to enslave
++		subnet         string   // CIDR
++		gateway        string   // bridge IP inside subnet
++		dhcpStart      string   // optional — leave blank to skip DHCP server
++		dhcpStop       string
++		dhcpSharedName string // unique per shared-network entry (CPLANE / LAN)
++		dhcpSubnetID   string // unique per subnet, required by VyOS 1.5 dhcp-server
++		natRuleNum     string // unique NAT source rule number
++		eveLMPStaticIP string // optional — only emitted on the control-plane bridge
++	}
++
++	emitBridge := func(b bridgeSpec) {
++		_, ipNet, err := net.ParseCIDR(b.subnet)
+ 		if err != nil {
+-			log.Fatalf("invalid vyos.lan_subnet %q: %v", v.LANSubnet, err)
++			log.Fatalf("invalid %s subnet %q: %v", b.brName, b.subnet, err)
+ 		}
+ 		prefix, _ := ipNet.Mask.Size()
+-		bridgeIP := fmt.Sprintf("%s/%d", v.LANGateway, prefix)
++		bridgeIP := fmt.Sprintf("%s/%d", b.gateway, prefix)
+ 		networkAddr := ipNet.String()
+ 
+-		// LAN bridge
+-		add("set interfaces bridge br0 description 'LAN'")
+-		add("set interfaces bridge br0 address '" + bridgeIP + "'")
+-		for _, iface := range v.LAN {
+-			add("set interfaces bridge br0 member interface " + iface)
++		add("set interfaces bridge " + b.brName + " description '" + b.desc + "'")
++		add("set interfaces bridge " + b.brName + " address '" + bridgeIP + "'")
++		for _, iface := range b.members {
++			add("set interfaces bridge " + b.brName + " member interface " + iface)
+ 		}
+ 
+-		// NAT masquerade
+-		add("set nat source rule 100 outbound-interface name '" + v.WAN + "'")
+-		add("set nat source rule 100 source address '" + networkAddr + "'")
+-		add("set nat source rule 100 translation address masquerade")
+-
+-		// DHCP server
+-		if v.DHCPStart != "" && v.DHCPStop != "" {
+-			// VyOS 1.5-rolling requires `subnet-id` per subnet in dhcp-server
+-			// (see service_dhcp-server.py conf_mode validation: "Unique subnet
+-			// ID not specified for subnet …"). Without it, the boot-time
+-			// commit fails with the generic `vyos-config[…]: Configuration
+-			// error`. We only have one subnet so id=1 is fine.
+-			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " subnet-id '1'")
+-			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " option default-router '" + v.LANGateway + "'")
++		// NAT masquerade — each bridge gets its own rule number.
++		// 'masquerade' MUST be single-quoted: cc_vyos_userdata's regex
++		// `^set <path> '<value>'$` only recognises a value when it is
++		// quoted. Without quotes, "masquerade" is appended to the path
++		// and committed as a node (`translation { address { masquerade
++		// } }`) instead of a leaf value (`translation { address
++		// "masquerade" }`), which VyOS rejects at commit with
++		// "Source NAT configuration error in rule N: translation
++		// requires address and/or port".
++		add("set nat source rule " + b.natRuleNum + " outbound-interface name '" + v.WAN + "'")
++		add("set nat source rule " + b.natRuleNum + " source address '" + networkAddr + "'")
++		add("set nat source rule " + b.natRuleNum + " translation address 'masquerade'")
++
++		// DHCP server — VyOS 1.5 requires per-subnet subnet-id.
++		if b.dhcpStart != "" && b.dhcpStop != "" {
++			p := "set service dhcp-server shared-network-name " + b.dhcpSharedName + " subnet " + networkAddr
++			add(p + " subnet-id '" + b.dhcpSubnetID + "'")
++			add(p + " option default-router '" + b.gateway + "'")
+ 			for _, ns := range v.NameServers {
+-				add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " option name-server '" + ns + "'")
++				add(p + " option name-server '" + ns + "'")
++			}
++			add(p + " range 0 start '" + b.dhcpStart + "'")
++			add(p + " range 0 stop '" + b.dhcpStop + "'")
++
++			// Static mapping for the EVE-side LMP DHCP client. The identifier
++			// (DHCP option 61) is "olg-eve" prefixed with 0x00 — see
++			// pkg/lps/lmp.go LMPClientIDHex for the matching client-id udhcpc
++			// sends. Lets ucentral-client's NATS bind address be a known
++			// constant instead of "whichever IP the pool happens to lease".
++			if b.eveLMPStaticIP != "" {
++				// VyOS 1.5 dhcp-server static-mapping uses `duid` (or `mac`),
++				// not `identifier` — see dhcp-server-common-config.xml.i in
++				// vyos-1x. Committing `identifier '...'` fails with
++				// "Either MAC address or Client identifier (DUID) is required
++				// for static mapping". Our DUID is 0x00 + ASCII "olg-eve" =
++				// 7 bytes; the matching client-id is in pkg/lps/lmp.go
++				// LMPClientIDHex.
++				add(p + " static-mapping eve duid '00:6f:6c:67:2d:65:76:65'")
++				add(p + " static-mapping eve ip-address '" + b.eveLMPStaticIP + "'")
+ 			}
+-			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " range 0 start '" + v.DHCPStart + "'")
+-			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " range 0 stop '" + v.DHCPStop + "'")
+ 		}
+ 
+-		// DNS forwarding
+-		add("set service dns forwarding cache-size '0'")
+-		add("set service dns forwarding listen-address '" + v.LANGateway + "'")
++		// DNS forwarding listens on each bridge gateway so clients can
++		// use it as a resolver. cache-size is set once below the loop.
++		add("set service dns forwarding listen-address '" + b.gateway + "'")
+ 		add("set service dns forwarding allow-from '" + networkAddr + "'")
+ 	}
+ 
++	dnsForwardingUsed := false
++
++	// VyOS bridge names are constrained by the interfaces_bridge XML
++	// definition to match `br[0-9]+` — alphabetic suffixes ("brcp",
++	// "brlan", ...) silently fail validation, abort the boot-time
++	// commit, and roll the device back to defaults (no LAN, no DHCP,
++	// unreachable). Stick with br0 / br1 / ... and rely on the
++	// per-bridge `description` to convey intent.
++
++	// Control-plane bridge: LMP VIF only. Always emit when cplane.Subnet
++	// and lmp_name are set — this is the bridge EVE's udhcpc lands on.
++	if v.CPlane.Subnet != "" && v.CPlane.Gateway != "" && v.LMPName != "" {
++		emitBridge(bridgeSpec{
++			brName:         "br0",
++			desc:           "CPlane",
++			members:        []string{v.LMPName},
++			subnet:         v.CPlane.Subnet,
++			gateway:        v.CPlane.Gateway,
++			dhcpStart:      v.CPlane.DHCPStart,
++			dhcpStop:       v.CPlane.DHCPStop,
++			dhcpSharedName: "CPLANE",
++			dhcpSubnetID:   "1",
++			natRuleNum:     "100",
++			eveLMPStaticIP: v.CPlane.EveLMPIP,
++		})
++		dnsForwardingUsed = true
++	}
++
++	// Data-plane LAN bridge: PCIe LAN ports for downstream clients.
++	// Skipped when vyos.lan is empty (e.g. QEMU profile has no
++	// non-management LAN ports).
++	if len(v.LAN) > 0 && v.LANSubnet != "" && v.LANGateway != "" {
++		emitBridge(bridgeSpec{
++			brName:         "br1",
++			desc:           "LAN",
++			members:        v.LAN,
++			subnet:         v.LANSubnet,
++			gateway:        v.LANGateway,
++			dhcpStart:      v.DHCPStart,
++			dhcpStop:       v.DHCPStop,
++			dhcpSharedName: "LAN",
++			dhcpSubnetID:   "2",
++			natRuleNum:     "101",
++		})
++		dnsForwardingUsed = true
++	}
++
++	if dnsForwardingUsed {
++		add("set service dns forwarding cache-size '0'")
++	}
++
+ 	for _, c := range v.Commands {
+ 		add(c)
+ 	}
+ 
+-	// Build the cloud-config part body. We assemble the multipart MIME
+-	// envelope below, since VyOS's cloud-init strips `bootcmd`/`runcmd` from
+-	// its module lists (see /etc/cloud/cloud.cfg.d/10_vyos.cfg) — only
+-	// growpart, resizefs_vyos, vyos_ifupdown, vyos, write_files,
+-	// vyos_userdata, vyos_install fire. To get the ethN rename to run
+-	// before vyos-router, we deliver it as a `text/cloud-boothook` MIME
+-	// part: cloud-init's BootHookPartHandler is registered unconditionally
+-	// (its handler runs at user-data consume time, not via a module), and
+-	// the script is executed early in the init stage on every boot.
+-	cloudConfig := "#cloud-config\nvyos_config_commands:\n" + strings.Join(cmds, "\n") + "\n"
++	// Build the cloud-config part body.
++	//
++	// Module-list note: stock VyOS cloud-init (config/cloud.cfg.d/10_vyos.cfg)
++	// ships with `cloud_final_modules: []` and no `runcmd`/`bootcmd` in
++	// the earlier stages. We patch the VyOS qcow2's vyos-cloud-init to
++	// re-enable runcmd / bootcmd / scripts_user / power_state_change —
++	// see olg-eve/vyos-builder-patches/. With that patch in place, the
++	// runcmd below fires; without it, runcmd is silently ignored and we
++	// fall back to the (broken) "config.boot written but never committed"
++	// state, which produces a usable bridge IP but no kea / dhcp-server.
++	//
++	// The runcmd line itself is the standard vbash incantation for
++	// re-applying config.boot in place: source script-template, enter
++	// configure mode via the alias, `load` the just-written config.boot,
++	// `commit`, `save` (in that order — save without commit is rejected),
++	// then `exit` config mode. shopt -s expand_aliases is required
++	// because `configure` is an alias and bash -c doesn't expand aliases
++	// by default.
++	//
++	// We still emit a text/cloud-boothook MIME part for the ethN rename:
++	// vyos_net_name (the udev hook that consumes hw-id) self-gates on
++	// boot_configuration_complete() and won't re-run at commit time, so
++	// rename-by-MAC must happen BEFORE vyos-router brings interfaces up.
++	const vyosCommitRuncmd = `- /bin/vbash -c "shopt -s expand_aliases; source /opt/vyatta/etc/functions/script-template; configure; load /opt/vyatta/etc/config/config.boot; commit; save; exit"`
++	cloudConfig := "#cloud-config\nvyos_config_commands:\n" + strings.Join(cmds, "\n") +
++		"\nruncmd:\n  " + vyosCommitRuncmd + "\n"
+ 
+ 	// Build the rename script if we have any MAC→ethN bindings to apply.
+ 	var boothook string
+-- 
+2.51.0
+
