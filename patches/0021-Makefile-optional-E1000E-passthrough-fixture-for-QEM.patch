@@ -1,0 +1,67 @@
+From c580dc13a84830555ef8d550536d824e00716392 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 26 May 2026 07:34:13 +0000
+Subject: [PATCH] Makefile: optional E1000E passthrough fixture for QEMU runs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a QEMU_OPTS_e1000e variable that injects two Intel 82574L
+(e1000e) NICs into the outer QEMU command, each behind its own
+pcie-root-port so they land in separate IOMMU groups and can be
+PCIe-passthrough'd to an EVE guest via vfio. Activated only when
+the user passes `E1000E=1` on the make command line — default
+behaviour is unchanged.
+
+Each NIC has an explicit `mac=` so the guest-side device MAC is
+deterministic across QEMU restarts; the cidata template in
+gen-loc-config can then pin specific guest ethN names to those MACs.
+
+Outer netdev subnets (192.168.3.0/24, 192.168.4.0/24) are picked
+so they don't collide with the existing eth0 management uplink
+(192.168.1.0/24) or the eth1 LMP network (192.168.2.0/24).
+
+Use:
+
+  make HV=kvm ROOTFS_VERSION=snapshot LPS_PROFILE=qemu E1000E=1 run-live
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ Makefile | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/Makefile b/Makefile
+index da171d5e9..177a64cb4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -318,6 +318,19 @@ else
+ QEMU_OPTS_eth1=-netdev user,id=eth1,net=$(IPS_NET2),dhcpstart=$(IPS_NET2_FIRST_IP) -device virtio-net-pci,netdev=eth1,romfile=""
+ endif
+ 
++# Two e1000e NICs each behind a dedicated pcie-root-port for IOMMU isolation,
++# so EVE can hand them off to a guest VM via vfio PCIe passthrough.
++# Activated when E1000E=1 is passed on the make command line.
++ifeq ($(E1000E),1)
++QEMU_OPTS_e1000e=\
++	-device pcie-root-port,id=rp.e1k1,chassis=10,addr=0x10 \
++	-netdev user,id=eth2,net=192.168.3.0/24,dhcpstart=192.168.3.10 \
++	-device e1000e,netdev=eth2,bus=rp.e1k1,addr=0x0,mac=52:54:00:e1:00:00 \
++	-device pcie-root-port,id=rp.e1k2,chassis=11,addr=0x11 \
++	-netdev user,id=eth3,net=192.168.4.0/24,dhcpstart=192.168.4.10 \
++	-device e1000e,netdev=eth3,bus=rp.e1k2,addr=0x0,mac=52:54:00:e1:00:01
++endif
++
+ QEMU_OPTS_amd64=-smbios type=1,serial=$(QEMU_EVE_SERIAL)
+ QEMU_OPTS_arm64=-smbios type=1,serial=$(QEMU_EVE_SERIAL) -drive file=fat:rw:$(dir $(DEVICETREE_DTB)),label=QEMU_DTB,format=vvfat
+ QEMU_OPTS_riscv64=-kernel $(UBOOT_IMG)/u-boot.bin -device virtio-blk,drive=uefi-disk
+@@ -333,6 +346,7 @@ QEMU_OPTS_COMMON= -m $(QEMU_MEMORY) -smp 4  $(QEMU_OPTS_BIOS) \
+         -rtc base=utc,clock=rt \
+         -netdev user,id=eth0,net=$(IPS_NET1),dhcpstart=$(IPS_NET1_FIRST_IP),hostfwd=tcp::$(SSH_PORT)-:22$(QEMU_TFTP_OPTS) -device virtio-net-pci,netdev=eth0,romfile="" \
+ 	$(QEMU_OPTS_eth1) \
++	$(QEMU_OPTS_e1000e) \
+         -device nec-usb-xhci,id=xhci \
+         -qmp unix:$(CURDIR)/qmp.sock,server,wait=off \
+         -object can-bus,id=canbus0 \
+-- 
+2.51.0
+

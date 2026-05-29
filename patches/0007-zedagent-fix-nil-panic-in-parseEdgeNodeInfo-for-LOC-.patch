@@ -1,0 +1,31 @@
+From 7a65bae4147a4efe3b36c9a33bf9f80bcdf2ba8c Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 10 Mar 2026 09:09:41 +0000
+Subject: [PATCH] zedagent: fix nil panic in parseEdgeNodeInfo for LOC
+ configs
+
+parseEdgeNodeInfo called config.GetId().Uuid which panics when the Id
+field is absent (as in LOC-sourced configs). Use the nil-safe proto
+getter GetUuid() instead.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/zedagent/parseedgenodeinfo.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/pkg/pillar/cmd/zedagent/parseedgenodeinfo.go b/pkg/pillar/cmd/zedagent/parseedgenodeinfo.go
+index e8dd9ac88..928711c8c 100644
+--- a/pkg/pillar/cmd/zedagent/parseedgenodeinfo.go
++++ b/pkg/pillar/cmd/zedagent/parseedgenodeinfo.go
+@@ -15,7 +15,7 @@ func parseEdgeNodeInfo(ctx *getconfigContext,
+ 
+ 	log.Tracef("Started parsing edge node information")
+ 
+-	deviceID, _ := uuid.FromString(config.GetId().Uuid)
++	deviceID, _ := uuid.FromString(config.GetId().GetUuid())
+ 	projectID, _ := uuid.FromString(config.GetProjectId())
+ 	enInfo := types.EdgeNodeInfo{}
+ 	enInfo = types.EdgeNodeInfo{
+-- 
+2.51.0
+

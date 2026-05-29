@@ -1,0 +1,155 @@
+From 85c622b0397576da29ad56ecf4e97797d12cbf99 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 18 Mar 2026 09:03:28 +0000
+Subject: [PATCH] gen-loc-config: add cloud-init support
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 85 +++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index 9be1c68f6..5f6ac9506 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -27,10 +27,12 @@ package main
+ 
+ import (
+ 	"crypto/sha256"
++	"encoding/base64"
+ 	"encoding/hex"
+ 	"flag"
+ 	"fmt"
+ 	"log"
++	"net"
+ 	"os"
+ 	"strings"
+ 
+@@ -58,6 +60,22 @@ type ProfileInterface struct {
+ 	AssignGrp string `yaml:"assigngrp"` // IOMMU group e.g. "group14" (pcie only)
+ }
+ 
++// VyOSConfig describes the VyOS networking to configure via cloud-init.
++// Interface names (WAN, LAN) refer to interfaces as seen INSIDE the VM
++// after EVE's EnforceNetworkInterfaceOrder assigns PCI slots.
++type VyOSConfig struct {
++	WAN         string   `yaml:"wan"`              // WAN interface name inside VM (gets DHCP)
++	LAN         []string `yaml:"lan"`              // LAN interface names inside VM
++	LANSubnet   string   `yaml:"lan_subnet"`       // e.g. "192.168.1.0/24"
++	LANGateway  string   `yaml:"lan_gateway"`      // e.g. "192.168.1.1"
++	DHCPStart   string   `yaml:"dhcp_range_start"` // e.g. "192.168.1.100"
++	DHCPStop    string   `yaml:"dhcp_range_stop"`  // e.g. "192.168.1.200"
++	Hostname    string   `yaml:"hostname"`
++	NameServers []string `yaml:"name_servers"` // DNS servers pushed to DHCP clients
++	CIOutput    string   `yaml:"ci_output"`    // output path for the cloud-init ISO
++	Commands    []string `yaml:"commands"`     // additional VyOS set commands appended last
++}
++
+ // Profile describes a compile-time machine configuration loaded from a YAML file.
+ type Profile struct {
+ 	Name  string `yaml:"name"`
+@@ -87,6 +105,7 @@ type Profile struct {
+ 	VNCPasswd  string             `yaml:"vnc_passwd"`
+ 	SSHKey     string             `yaml:"ssh_key"`
+ 	Output     string             `yaml:"output"`
++	VyOS       VyOSConfig         `yaml:"vyos"`
+ }
+ 
+ func loadProfile(path string) (*Profile, error) {
+@@ -101,6 +120,69 @@ func loadProfile(path string) (*Profile, error) {
+ 	return &p, nil
+ }
+ 
++// generateVyOSUserData returns a VyOS cloud-init user-data string from the VyOS
++// config section of a profile. Returns "" if vyosCfg is nil or WAN is not set.
++// EVE passes UserData to the VM as a cloud-init NoCloud ISO image automatically.
++func generateVyOSUserData(vyosCfg *VyOSConfig) string {
++	if vyosCfg == nil || vyosCfg.WAN == "" {
++		return ""
++	}
++	v := vyosCfg
++	var cmds []string
++	add := func(s string) { cmds = append(cmds, "  - "+s) }
++
++	if v.Hostname != "" {
++		add("set system host-name '" + v.Hostname + "'")
++	}
++
++	// WAN interface: DHCP client
++	add("set interfaces ethernet " + v.WAN + " description 'WAN'")
++	add("set interfaces ethernet " + v.WAN + " address 'dhcp'")
++
++	if len(v.LAN) > 0 && v.LANSubnet != "" && v.LANGateway != "" {
++		_, ipNet, err := net.ParseCIDR(v.LANSubnet)
++		if err != nil {
++			log.Fatalf("invalid vyos.lan_subnet %q: %v", v.LANSubnet, err)
++		}
++		prefix, _ := ipNet.Mask.Size()
++		bridgeIP := fmt.Sprintf("%s/%d", v.LANGateway, prefix)
++		networkAddr := ipNet.String()
++
++		// LAN bridge
++		add("set interfaces bridge br0 description 'LAN'")
++		add("set interfaces bridge br0 address '" + bridgeIP + "'")
++		for _, iface := range v.LAN {
++			add("set interfaces bridge br0 member interface " + iface)
++		}
++
++		// NAT masquerade
++		add("set nat source rule 100 outbound-interface name '" + v.WAN + "'")
++		add("set nat source rule 100 source address '" + networkAddr + "'")
++		add("set nat source rule 100 translation address masquerade")
++
++		// DHCP server
++		if v.DHCPStart != "" && v.DHCPStop != "" {
++			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " option default-router '" + v.LANGateway + "'")
++			for _, ns := range v.NameServers {
++				add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " option name-server '" + ns + "'")
++			}
++			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " range 0 start '" + v.DHCPStart + "'")
++			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " range 0 stop '" + v.DHCPStop + "'")
++		}
++
++		// DNS forwarding
++		add("set service dns forwarding cache-size '0'")
++		add("set service dns forwarding listen-address '" + v.LANGateway + "'")
++		add("set service dns forwarding allow-from '" + networkAddr + "'")
++	}
++
++	for _, c := range v.Commands {
++		add(c)
++	}
++
++	return "#cloud-config\nvyos_config_commands:\n" + strings.Join(cmds, "\n") + "\n"
++}
++
+ func main() {
+ 	profilePath := flag.String("profile", "", "Path to a YAML machine profile (overrides individual flags)")
+ 	name := flag.String("name", "loc-vm", "VM display name")
+@@ -122,6 +204,7 @@ func main() {
+ 	// Profile fields that have no flag equivalents.
+ 	var lmp string
+ 	var profileInterfaces []ProfileInterface
++	var vyosCfg *VyOSConfig
+ 
+ 	// If a profile is given, load it and override all parameters.
+ 	if *profilePath != "" {
+@@ -144,6 +227,7 @@ func main() {
+ 		*sshKey = p.SSHKey
+ 		lmp = p.LMP
+ 		profileInterfaces = p.Interfaces
++		vyosCfg = &p.VyOS
+ 		if p.Output != "" {
+ 			*output = p.Output
+ 		}
+@@ -400,6 +484,7 @@ func main() {
+ 				},
+ 				Interfaces: appInterfaces,
+ 				Adapters:   pcieAdapters,
++				UserData:   base64.StdEncoding.EncodeToString([]byte(generateVyOSUserData(vyosCfg))),
+ 				Activate:   true,
+ 			},
+ 		},
+-- 
+2.51.0
+

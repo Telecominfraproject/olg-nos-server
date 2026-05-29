@@ -1,0 +1,32 @@
+From 63106e20e4a620f2be4b39f00e64db1bd0193247 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 27 May 2026 11:26:57 +0000
+Subject: [PATCH] pkg/lps: gitignore the bundled VyOS qcow2 so linuxkit doesn't
+ tag dirty
+
+The 750MB VyOS image lives at pkg/lps/images/small-vyos-ssh-nat.qcow2
+in the working tree but isn't tracked in git. Without this entry,
+linuxkit's pkg hash calculator sees the untracked file and computes
+'<sha>-dirty-<short>' as the LPS image tag, which then can't be pulled
+from docker.io at rootfs-assembly time and breaks the build.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/lps/.gitignore | 5 +++++
+ 1 file changed, 5 insertions(+)
+ create mode 100644 pkg/lps/.gitignore
+
+diff --git a/pkg/lps/.gitignore b/pkg/lps/.gitignore
+new file mode 100644
+index 000000000..51f889ba1
+--- /dev/null
++++ b/pkg/lps/.gitignore
+@@ -0,0 +1,5 @@
++# VyOS qcow2 image is large (~750MB) and lives outside git tracking.
++# Without this entry, the untracked file makes linuxkit compute a
++# "-dirty-…" tag for the LPS pkg, which then can't be pulled at rootfs
++# assembly time and fails the build.
++images/*.qcow2
+-- 
+2.51.0
+

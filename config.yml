@@ -1,0 +1,7 @@
+repo:  https://github.com/lf-edge/eve.git
+branch: master
+revision: bf6e6e259f18a3d87efa0493fbbbddcdd31e4359
+output_dir: eve
+
+patch_folders:
+  - patches

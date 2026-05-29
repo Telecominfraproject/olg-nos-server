@@ -1,0 +1,67 @@
+From f02d48668398b0440acce4b2af699907dc0a4074 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 11 Mar 2026 10:26:47 +0000
+Subject: [PATCH] downloader: treat localhost/loopback datastores as
+ local
+
+When the LMP port has no IP (not connected to a network with a DHCP
+server), CountLocalAddrNoLinkLocalWithCost returns 0 and the downloader
+immediately fails with "No IP management port addresses with cost <= 0",
+even when the datastore URL is http://localhost:8888/ (the on-device LPS
+HTTP server).
+
+Downloading from localhost requires no management port at all.  Replace
+the inline ".local" suffix check with isLocalServerURL(), which also
+matches "localhost" and 127.x.x.x loopback addresses.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/downloader/syncop.go | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/pillar/cmd/downloader/syncop.go b/pkg/pillar/cmd/downloader/syncop.go
+index 4c3b82c46..a2aee7b72 100644
+--- a/pkg/pillar/cmd/downloader/syncop.go
++++ b/pkg/pillar/cmd/downloader/syncop.go
+@@ -181,8 +181,10 @@ func handleSyncOp(ctx *downloaderContext, key string,
+ 			key, errStr, cancelled)
+ 	}
+ 
+-	// if the server URL ends with '.local', it is considered to be local data store
+-	dsLocal := strings.HasSuffix(serverURL, ".local") || strings.HasSuffix(serverURL, ".local.")
++	// if the server URL ends with '.local', or points to localhost/loopback,
++	// it is considered to be a local data store that does not require a
++	// management port with internet access.
++	dsLocal := isLocalServerURL(serverURL)
+ 	if dsLocal {
+ 		addrCount = 1
+ 	} else {
+@@ -338,6 +340,25 @@ func handleSyncOp(ctx *downloaderContext, key string,
+ 		key, errStr, cancelled)
+ }
+ 
++// isLocalServerURL returns true if the server URL points to a local resource
++// that does not require a management port with internet access: mDNS .local
++// hostnames, "localhost", or loopback IP addresses (127.x.x.x).
++func isLocalServerURL(serverURL string) bool {
++	if strings.HasSuffix(serverURL, ".local") || strings.HasSuffix(serverURL, ".local.") {
++		return true
++	}
++	u, err := url.Parse(serverURL)
++	if err != nil {
++		return false
++	}
++	host := u.Hostname()
++	if host == "localhost" {
++		return true
++	}
++	ip := net.ParseIP(host)
++	return ip != nil && ip.IsLoopback()
++}
++
+ // DownloadURL format : http://<serverURL>/dpath/filename
+ func getServerURL(dsCtx *types.DatastoreContext) (string, error) {
+ 	u, err := url.Parse(dsCtx.DownloadURL)
+-- 
+2.51.0
+

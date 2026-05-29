@@ -1,0 +1,65 @@
+From e88970cf193c4e8f4f1f7a56d66f655265809b03 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Mon, 25 May 2026 12:37:08 +0000
+Subject: [PATCH] Makefile: route EVE serial + monitor through unix sockets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace `-serial mon:stdio` with a unix-socket-backed chardev and
+expose the QEMU monitor on its own unix socket. Two motivations:
+
+  1. `mon:stdio` ties the EVE serial to the parent process's tty,
+     which means a `make run-live` launched in the background loses
+     interactivity entirely (stdin = /dev/null), and one launched in
+     the foreground locks the only console to that single shell. With
+     a unix socket, any number of clients can attach/detach without
+     restarting QEMU.
+
+  2. The mux-on-stdio meant typing into the EVE serial required
+     remembering `Ctrl-A C` to flip QEMU's input focus off the
+     monitor. Separating monitor onto `eve-mon.sock` removes the mux
+     entirely on the serial path, so socat/tio attach is "just type
+     and it lands in the guest shell".
+
+After this change:
+
+  eve/eve-serial.sock   EVE host serial (read+write)
+  eve/eve-mon.sock      QEMU monitor (text protocol)
+  eve/qmp.sock          QMP (JSON, unchanged from before)
+
+Attach interactively:
+
+  socat -,raw,echo=0,escape=0x1d UNIX-CONNECT:eve/eve-serial.sock
+  # Ctrl-]  to detach
+
+Capture serial without blocking the terminal:
+
+  socat -u UNIX-CONNECT:eve/eve-serial.sock - > serial.log &
+
+No functional change to the EVE OS itself — the change is entirely on
+the outer QEMU command line.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ Makefile | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index dce5cb294..da171d5e9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -326,7 +326,9 @@ QEMU_OPTS_VGA_DISPLAY_amd64=-vga std
+ QEMU_OPTS_VGA_DISPLAY_arm64=-device virtio-gpu-pci -usb -device usb-ehci,id=ehci -device usb-kbd,bus=ehci.0
+ QEMU_OPTS_VGA_DISPLAY_riscv64=-vga std
+ QEMU_OPTS_COMMON= -m $(QEMU_MEMORY) -smp 4  $(QEMU_OPTS_BIOS) \
+-        -serial mon:stdio      \
++        -chardev socket,id=ser0,path=$(CURDIR)/eve-serial.sock,server=on,wait=off \
++        -serial chardev:ser0 \
++        -monitor unix:$(CURDIR)/eve-mon.sock,server,nowait \
+         -global ICH9-LPC.noreboot=false -watchdog-action reset \
+         -rtc base=utc,clock=rt \
+         -netdev user,id=eth0,net=$(IPS_NET1),dhcpstart=$(IPS_NET1_FIRST_IP),hostfwd=tcp::$(SSH_PORT)-:22$(QEMU_TFTP_OPTS) -device virtio-net-pci,netdev=eth0,romfile="" \
+-- 
+2.51.0
+

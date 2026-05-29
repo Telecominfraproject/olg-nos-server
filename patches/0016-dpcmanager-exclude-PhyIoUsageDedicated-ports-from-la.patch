@@ -1,0 +1,63 @@
+From 431942cc53388638dd09919ff15bb7752ab89545 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 11 Mar 2026 09:30:59 +0000
+Subject: [PATCH] dpcmanager: exclude PhyIoUsageDedicated ports from
+ last-resort DPC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Ports marked as dedicated for app passthrough (PCIe passthrough) were
+being included in the last-resort DPC because their UsedByUUID is never
+set until a VM successfully starts — creating a circular dependency:
+NIM marks the port as a zedrouter port, domainmgr refuses to assign it,
+the VM never starts, so UsedByUUID is never set.
+
+Add IoBundle.IsDedicatedToApp() and use it in isInterfaceAssigned() so
+that PhyIoUsageDedicated ports are excluded from the last-resort DPC
+regardless of whether they are currently in use by a VM.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/dpcmanager/lastresort.go    | 6 ++++++
+ pkg/pillar/types/assignableadapters.go | 7 +++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/pkg/pillar/dpcmanager/lastresort.go b/pkg/pillar/dpcmanager/lastresort.go
+index b299cadd8..48c1a1c35 100644
+--- a/pkg/pillar/dpcmanager/lastresort.go
++++ b/pkg/pillar/dpcmanager/lastresort.go
+@@ -101,6 +101,12 @@ func (m *DpcManager) isInterfaceAssigned(ifName string) bool {
+ 	if ib.UsedByUUID != nilUUID {
+ 		return true
+ 	}
++	// Ports dedicated for app passthrough (e.g. PCIe passthrough) must never
++	// be included in the last-resort DPC; doing so would mark them as zedrouter
++	// ports and block the passthrough assignment.
++	if ib.IsDedicatedToApp() {
++		return true
++	}
+ 	return false
+ }
+ 
+diff --git a/pkg/pillar/types/assignableadapters.go b/pkg/pillar/types/assignableadapters.go
+index a3b99528c..c509cc8f6 100644
+--- a/pkg/pillar/types/assignableadapters.go
++++ b/pkg/pillar/types/assignableadapters.go
+@@ -210,6 +210,13 @@ type VfInfo struct {
+ // Really a constant
+ var nilUUID = uuid.UUID{}
+ 
++// IsDedicatedToApp returns true if this IoBundle is dedicated for direct
++// assignment to an application (e.g. PCIe passthrough) and must not be
++// managed by NIM as a host network port.
++func (ib IoBundle) IsDedicatedToApp() bool {
++	return ib.Usage == zcommon.PhyIoMemberUsage_PhyIoUsageDedicated
++}
++
+ // IsUSBController checks if the IoBundle is a USB controller, including when using the deprecated type IoUSB
+ func (ib IoBundle) IsUSBController() bool {
+ 	if ib.Type == IoUSBController {
+-- 
+2.51.0
+

@@ -1,0 +1,557 @@
+From 51928680bd1ad6bd84533286df3d01951c09ef46 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 26 May 2026 07:35:58 +0000
+Subject: [PATCH] gen-loc-config: PCIe passthrough with deterministic ethN
+ naming
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+End-to-end fixes for running EVE + VyOS with PCIe NIC passthrough in
+the qemu profile. Several intermediate bugs surfaced and are fixed
+here together because they're entangled (a fix at one layer reveals
+the next).
+
+A. Passthrough-mode SystemAdapterList. When DeviceIoList contains any
+   PhyIoUsageDedicated PCIe entries, NIM treats SystemAdapterList as
+   authoritative — anything not listed is invisible to zedrouter and
+   any NetworkInstance with a `Port: name` referencing an unlisted
+   port fails with "no port is matching label <name>". The previous
+   logic listed only the LMP and treated it as the management uplink,
+   which (a) lost EVE's actual management uplink so EVE had no
+   192.168.1.x address (SSH hostfwd broken) and (b) hid switch-NI
+   ports from zedrouter so the inner LAN-bridge NI never activated.
+
+   Fix: when hasPCIe, declare three classes of SystemAdapter:
+     * MgmtUplink (profile.mgmt_uplink, Uplink=true, DHCP NetworkUUID)
+     * LMP port (Uplink=false, bridge member of LMP NI)
+     * Each switch-NI port (Uplink=false, bridge member of its NI)
+   Plus matching PhysicalIO entries with Usage=Shared. PCIe adapters
+   keep Usage=Dedicated so patch 0016's last-resort filter ignores them.
+
+B. DHCP subnet-id (VyOS 1.5-rolling). service_dhcp-server.py now requires
+   a unique subnet-id per shared-network subnet. Without one, boot-time
+   load_bootfile fails with the generic "Configuration error". Emit
+   `subnet-id '1'` (we only have one subnet).
+
+C. Deterministic guest ethN naming. The cidata template assumes
+   eth0=LMP-VIF, eth1=switch-NI-VIF, ethN+=PCIe-passthrough. Empirically
+   Linux's driver probe order on this VM puts the e1000e devices at
+   eth0/eth1 ahead of the virtio NICs, breaking the assumption.
+
+   VyOS's canonical hw-id udev mechanism doesn't help on first boot
+   because vyos_net_name short-circuits after vyos-config_status is
+   written — by the time our cidata runs it has long since fired.
+
+   Fix: deliver the cidata as multipart MIME with a `text/cloud-boothook`
+   part that runs in cloud-init-local (before vyos-router) and renames
+   each kernel ifname by MAC. Two-pass POSIX shell so it can safely
+   swap names: first move each interface to a temp `_t<i>_<desired>`,
+   then rename each temp to the encoded final. Requires populating
+   VyOSConfig.EthHwIds from main() with the LMP/switch-NI VIF MACs +
+   the new ProfileInterface.Mac field for PCIe entries.
+
+   VyOS's cloud-init has bootcmd/runcmd stripped from cloud_init_modules
+   (per /etc/cloud/cloud.cfg.d/10_vyos.cfg), so a simple bootcmd is a
+   no-op. BootHookPartHandler is registered unconditionally and runs at
+   user-data consume time, hence the multipart MIME wrapping.
+
+D. Defeat vyos-interface-rescan hw-id corruption. vyos-router calls
+   vyos-interface-rescan.py after our cidata applies; it reads
+   /run/udev/vyos/<ifname> (cached at coldplug, before our rename) and
+   writes config.set([..., ifname, 'hw-id'], <stale-MAC>) over the
+   correct hw-id our cidata had just written. interfaces_ethernet
+   apply() then calls Interface.set_mac(hw_id) and corrupts the live
+   kernel MAC (two interfaces end up with the same MAC).
+
+   Per python/vyos/ifconfig/interface.py:1785-1786 the `mac` directive
+   takes precedence over `hw-id` in update(), so emit BOTH
+   `set interfaces ethernet ethN mac '<MAC>'` AND `set ... hw-id '<MAC>'`.
+   The `mac` survives rescan (rescan only writes hw-id) and is what
+   set_mac() ends up applying.
+
+E. profile.MgmtUplink + ProfileInterface.Mac fields. Already covered
+   above; mentioned here for changelog completeness.
+
+Verified end-to-end on the qemu profile with E1000E=1:
+- Both e1000e devices bound to vfio-pci on EVE, presented as Intel
+  82574L inside VyOS at PCI 04:00.0 and 05:00.0.
+- VyOS interface names match cidata template:
+    eth0 = 02:16:3e:7a:2c:58 (switch NI VIF, br0 member)
+    eth1 = 02:16:3e:f0:c1:9b (LMP VIF, 192.168.2.11/24 WAN)
+    eth2 = 52:54:00:e1:00:00 (e1000e #1)
+    eth3 = 52:54:00:e1:00:01 (e1000e #2)
+- No "vyos-config[...]: Configuration error" in logs.
+- EVE has 192.168.1.10/24 management uplink; SSH hostfwd works.
+- VyOS reachable at 192.168.2.11; LAN bridge br0 has 192.168.33.1/24.
+
+Refs:
+- VyOS hw-id mechanism: src/udev/vyos_net_name, src/etc/udev/rules.d/65-vyos-net.rules
+- rescan corruption: src/helpers/vyos-interface-rescan.py (config.set hw-id from stale cache)
+- mac directive precedence: python/vyos/ifconfig/interface.py:1785-1786
+- DHCP subnet-id requirement: src/conf_mode/service_dhcp-server.py (validation error)
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 328 ++++++++++++++++++++++----
+ 1 file changed, 288 insertions(+), 40 deletions(-)
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index 6cdaceeac..4952341a0 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -34,6 +34,7 @@ import (
+ 	"log"
+ 	"net"
+ 	"os"
++	"sort"
+ 	"strings"
+ 
+ 	zconfig "github.com/lf-edge/eve-api/go/config"
+@@ -58,6 +59,12 @@ type ProfileInterface struct {
+ 	Type      string `yaml:"type"`      // "switch" or "pcie"
+ 	PciLong   string `yaml:"pci"`       // PCI address e.g. "0000:02:00.0" (pcie only)
+ 	AssignGrp string `yaml:"assigngrp"` // IOMMU group e.g. "group14" (pcie only)
++	// Mac is the MAC address of the device as the guest will see it. For
++	// pcie passthrough this is the NIC's hardware MAC (the device's EEPROM
++	// for real hardware, or QEMU's explicit `mac=` argument for tests).
++	// When set, gen-loc-config will pin a specific guest ethN to this MAC
++	// via VyOS hw-id binding so probe order does not dictate the name.
++	Mac string `yaml:"mac"`
+ }
+ 
+ // VyOSConfig describes the VyOS networking to configure via cloud-init.
+@@ -79,6 +86,15 @@ type VyOSConfig struct {
+ 	// EVE's EnforceNetworkInterfaceOrder) plus VyOS's `net.ifnames=0
+ 	// biosdevname=0` kernel cmdline. Defaults to "eth100" if not set.
+ 	LMPName string `yaml:"lmp_name"`
++
++	// EthHwIds is populated by main() from the computed VIF MACs (and from
++	// profile.interfaces[].mac for PCIe passthrough devices). The generated
++	// cidata emits `set interfaces ethernet <ethN> hw-id '<mac>'` for each
++	// entry, so VyOS renames the kernel-side ifname to match regardless of
++	// driver-load probe order. Without this, e1000e passthrough devices
++	// often grab eth0/eth1 ahead of the virtio NICs, breaking the cidata's
++	// assumption that the LMP/switch VIFs land at the expected names.
++	EthHwIds map[string]string `yaml:"-"`
+ }
+ 
+ // Profile describes a compile-time machine configuration loaded from a YAML file.
+@@ -104,6 +120,14 @@ type Profile struct {
+ 	} `yaml:"network"`
+ 	// LMP (Local Management Port): bridged to a Switch NI; VM gets eth0 on it.
+ 	LMP string `yaml:"lmp"`
++	// MgmtUplink is the EVE-side ethN that should be the management uplink
++	// (EVE's outbound network for control plane / fetch / SSH). Used only
++	// when SystemAdapterList must be set explicitly (PCIe-passthrough mode)
++	// because NIM's last-resort DPC otherwise auto-discovers it. For the
++	// QEMU profile this is `eth0` (the first virtio NIC, wired to outer
++	// QEMU's user-net 192.168.1.0/24 with hostfwd 2222→22). For real
++	// hardware, set to whichever physical port has the management network.
++	MgmtUplink string `yaml:"mgmt_uplink"`
+ 	// Interfaces: additional ports handed to the VM in order (eth1, eth2, …).
+ 	// type: switch → Switch NI (L2 bridge); type: pcie → PCIe passthrough.
+ 	Interfaces []ProfileInterface `yaml:"interfaces"`
+@@ -140,15 +164,40 @@ func generateVyOSUserData(vyosCfg *VyOSConfig) string {
+ 		add("set system host-name '" + v.Hostname + "'")
+ 	}
+ 
+-	// Deterministic ethN naming is guaranteed by two existing mechanisms:
+-	//   1. EVE's `EnforceNetworkInterfaceOrder=true` (set unconditionally
+-	//      below) makes pciAddressAllocator pin each VIF to a fixed PCI
+-	//      bus slot per VifOrder — same VM config → same slots every boot.
+-	//   2. VyOS's kernel cmdline carries `net.ifnames=0 biosdevname=0`,
+-	//      so the kernel uses legacy ethN names assigned by PCI bus order.
+-	// No `set interfaces ethernet <iface> hw-id '<mac>'` is emitted — the
+-	// pin above is enough, and adding hw-id added nothing useful while
+-	// risking drift if the VM gets re-MAC'd.
++	// Clear all ethernet entries we control, then re-pin each to the right
++	// MAC via hw-id. Reasoning:
++	//   1. The stock small-vyos-ssh-nat image ships baked-in entries for
++	//      eth0/eth1 with address/hw-id/mtu/offload that conflict with our
++	//      bridge-member usage (`address dhcp` on a bridge member is
++	//      rejected — see task #27).
++	//   2. vyos-interface-rescan rewrites entries with the *currently
++	//      observed* kernel MAC at boot. After our boothook renames the
++	//      kernel ifnames, rescan can leave config.boot with an ethN→MAC
++	//      mapping that doesn't match what we intend, and at commit time
++	//      VyOS's interfaces_ethernet apply() FORCES the kernel MAC to
++	//      whatever hw-id says (see vyos-1x interfaces_ethernet.py and
++	//      ifconfig/interface.py:1781-1788). That overrides the actual
++	//      hardware MAC and breaks L2 ('two interfaces with the same MAC').
++	// So: delete every ethN we set up, then re-pin BOTH `mac` and `hw-id`
++	// to the desired MAC. The `mac` directive is the critical one — per
++	// vyos-1x python/vyos/ifconfig/interface.py:1785-1786, `update(config)`
++	// uses `mac` if set, falling back to `hw-id` otherwise. Setting `mac`
++	// makes the live kernel MAC application immune to vyos-interface-rescan
++	// re-writing `hw-id` from its stale /run/udev/vyos/ cache after the
++	// cloud-init boothook rename. `delete` on a missing path is non-fatal.
++	hwKeys := make([]string, 0, len(v.EthHwIds))
++	for k := range v.EthHwIds {
++		hwKeys = append(hwKeys, k)
++	}
++	sort.Strings(hwKeys)
++	for _, ethN := range hwKeys {
++		add("delete interfaces ethernet " + ethN)
++	}
++	for _, ethN := range hwKeys {
++		mac := strings.ToLower(v.EthHwIds[ethN])
++		add("set interfaces ethernet " + ethN + " hw-id '" + mac + "'")
++		add("set interfaces ethernet " + ethN + " mac '" + mac + "'")
++	}
+ 
+ 	// WAN interface: DHCP client
+ 	add("set interfaces ethernet " + v.WAN + " description 'WAN'")
+@@ -163,20 +212,6 @@ func generateVyOSUserData(vyosCfg *VyOSConfig) string {
+ 		bridgeIP := fmt.Sprintf("%s/%d", v.LANGateway, prefix)
+ 		networkAddr := ipNet.String()
+ 
+-		// Wipe any baked-in ethernet config on each LAN member before
+-		// making it a bridge port. The stock small-vyos-ssh-nat image
+-		// ships with `interfaces ethernet eth0 { address "dhcp"; hw-id …;
+-		// mtu …; offload {…} }`, and VyOS's verify_address rejects a
+-		// bridge member that still has an address — the boot-time commit
+-		// fails with `Cannot assign address to interface "eth0" as it is
+-		// a member of bridge "br0"!` and load_bootfile then prints the
+-		// generic `vyos-config[…]: Configuration error`.
+-		// `delete` on a path that does not exist is a non-fatal warning,
+-		// so this is safe even if a future image stops shipping the node.
+-		for _, iface := range v.LAN {
+-			add("delete interfaces ethernet " + iface)
+-		}
+-
+ 		// LAN bridge
+ 		add("set interfaces bridge br0 description 'LAN'")
+ 		add("set interfaces bridge br0 address '" + bridgeIP + "'")
+@@ -191,6 +226,12 @@ func generateVyOSUserData(vyosCfg *VyOSConfig) string {
+ 
+ 		// DHCP server
+ 		if v.DHCPStart != "" && v.DHCPStop != "" {
++			// VyOS 1.5-rolling requires `subnet-id` per subnet in dhcp-server
++			// (see service_dhcp-server.py conf_mode validation: "Unique subnet
++			// ID not specified for subnet …"). Without it, the boot-time
++			// commit fails with the generic `vyos-config[…]: Configuration
++			// error`. We only have one subnet so id=1 is fine.
++			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " subnet-id '1'")
+ 			add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " option default-router '" + v.LANGateway + "'")
+ 			for _, ns := range v.NameServers {
+ 				add("set service dhcp-server shared-network-name LAN subnet " + networkAddr + " option name-server '" + ns + "'")
+@@ -209,7 +250,89 @@ func generateVyOSUserData(vyosCfg *VyOSConfig) string {
+ 		add(c)
+ 	}
+ 
+-	return "#cloud-config\nvyos_config_commands:\n" + strings.Join(cmds, "\n") + "\n"
++	// Build the cloud-config part body. We assemble the multipart MIME
++	// envelope below, since VyOS's cloud-init strips `bootcmd`/`runcmd` from
++	// its module lists (see /etc/cloud/cloud.cfg.d/10_vyos.cfg) — only
++	// growpart, resizefs_vyos, vyos_ifupdown, vyos, write_files,
++	// vyos_userdata, vyos_install fire. To get the ethN rename to run
++	// before vyos-router, we deliver it as a `text/cloud-boothook` MIME
++	// part: cloud-init's BootHookPartHandler is registered unconditionally
++	// (its handler runs at user-data consume time, not via a module), and
++	// the script is executed early in the init stage on every boot.
++	cloudConfig := "#cloud-config\nvyos_config_commands:\n" + strings.Join(cmds, "\n") + "\n"
++
++	// Build the rename script if we have any MAC→ethN bindings to apply.
++	var boothook string
++	if len(v.EthHwIds) > 0 {
++		keys := make([]string, 0, len(v.EthHwIds))
++		for k := range v.EthHwIds {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		// POSIX-shell rename script. Cloud-init boothooks are written to
++		// /var/lib/cloud/instance/boothooks/ and executed with /bin/sh on
++		// every boot, so no associative arrays / [[ ]] / etc.
++		// Strategy: two passes. Pass 1 finds each desired MAC's current
++		// kernel ifname and renames it to a temp name `_t<i>_<desired>`,
++		// encoding the final name in the temp. Pass 2 walks
++		// /sys/class/net/_t* and renames each temp to the encoded final.
++		// This avoids name collisions when two interfaces need to swap.
++		var b strings.Builder
++		b.WriteString("#cloud-boothook\n")
++		b.WriteString("#!/bin/sh\n")
++		b.WriteString("set -e\n")
++		b.WriteString("i=100\n")
++		for _, eth := range keys {
++			mac := strings.ToLower(v.EthHwIds[eth])
++			fmt.Fprintf(&b, "mac='%s'; desired='%s'\n", mac, eth)
++			b.WriteString("cur=\"\"\n")
++			b.WriteString("for d in /sys/class/net/*; do\n")
++			b.WriteString("    [ -f \"$d/address\" ] || continue\n")
++			b.WriteString("    if [ \"$(cat \"$d/address\")\" = \"$mac\" ]; then\n")
++			b.WriteString("        cur=\"$(basename \"$d\")\"; break\n")
++			b.WriteString("    fi\n")
++			b.WriteString("done\n")
++			b.WriteString("if [ -n \"$cur\" ] && [ \"$cur\" != \"$desired\" ]; then\n")
++			b.WriteString("    ip link set \"$cur\" down 2>/dev/null || true\n")
++			b.WriteString("    ip link set \"$cur\" name \"_t${i}_${desired}\"\n")
++			b.WriteString("    i=$((i+1))\n")
++			b.WriteString("fi\n")
++		}
++		b.WriteString("for d in /sys/class/net/_t*; do\n")
++		b.WriteString("    [ -d \"$d\" ] || continue\n")
++		b.WriteString("    cur=\"$(basename \"$d\")\"\n")
++		b.WriteString("    desired=\"${cur#_t}\"; desired=\"${desired#*_}\"\n")
++		b.WriteString("    ip link set \"$cur\" name \"$desired\"\n")
++		b.WriteString("done\n")
++		boothook = b.String()
++	}
++
++	// If there's nothing to boothook, emit single-part #cloud-config (the
++	// original simple format). Otherwise wrap both parts as multipart MIME
++	// — cloud-init parses the outer Content-Type and dispatches each part
++	// to its handler.
++	if boothook == "" {
++		return cloudConfig
++	}
++	boundary := "===eve-cidata-boundary==="
++	var m strings.Builder
++	m.WriteString("Content-Type: multipart/mixed; boundary=\"" + boundary + "\"\n")
++	m.WriteString("MIME-Version: 1.0\n\n")
++	for _, part := range []struct{ ctype, body string }{
++		{"text/cloud-boothook", boothook},
++		{"text/cloud-config", cloudConfig},
++	} {
++		m.WriteString("--" + boundary + "\n")
++		m.WriteString("Content-Type: " + part.ctype + "; charset=\"us-ascii\"\n")
++		m.WriteString("MIME-Version: 1.0\n")
++		m.WriteString("Content-Transfer-Encoding: 7bit\n\n")
++		m.WriteString(part.body)
++		if !strings.HasSuffix(part.body, "\n") {
++			m.WriteString("\n")
++		}
++	}
++	m.WriteString("--" + boundary + "--\n")
++	return m.String()
+ }
+ 
+ func main() {
+@@ -232,6 +355,7 @@ func main() {
+ 
+ 	// Profile fields that have no flag equivalents.
+ 	var lmp string
++	var mgmtUplink string
+ 	var profileInterfaces []ProfileInterface
+ 	var vyosCfg *VyOSConfig
+ 
+@@ -255,6 +379,7 @@ func main() {
+ 		*vncPasswd = p.VNCPasswd
+ 		*sshKey = p.SSHKey
+ 		lmp = p.LMP
++		mgmtUplink = p.MgmtUplink
+ 		profileInterfaces = p.Interfaces
+ 		vyosCfg = &p.VyOS
+ 		if p.Output != "" {
+@@ -367,13 +492,20 @@ func main() {
+ 	// Other VirtIO NICs (uplink, switch NIs) follow at InterfaceOrder len(pcieAdapters)+2 onward.
+ 	var appInterfaces []*zconfig.NetworkAdapter
+ 
++	// MACs tracked here so we can later map them to the guest ethN names
++	// declared in the VyOSConfig (v.WAN, v.LAN[i]) and emit hw-id pinning
++	// in the cidata. See VyOSConfig.EthHwIds.
++	var lmpMACStr string
++	var switchVIFMACs []string
++
+ 	if lmp != "" {
+ 		lmpMAC := lmpMACFromUUIDs(uuid.FromStringOrNil(appUUID), uuid.FromStringOrNil(lmpNIUUID))
++		lmpMACStr = lmpMAC.String()
+ 		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+ 			Name:           "eth0",
+ 			NetworkId:      lmpNIUUID,
+ 			InterfaceOrder: 1,
+-			MacAddress:     lmpMAC.String(),
++			MacAddress:     lmpMACStr,
+ 			Acls: []*zconfig.ACE{
+ 				{
+ 					Name: "allow-all",
+@@ -397,7 +529,7 @@ func main() {
+ 	// adapterNum allocation:  0 = LMP, 1 = uplink, 2+ = switch NIs (in profile order)
+ 	virtIntfOrder := uint32(len(pcieAdapters) + 2)
+ 
+-	addVIF := func(niUUID string, adapterNum uint8) {
++	addVIF := func(niUUID string, adapterNum uint8, recordSwitchMAC bool) {
+ 		vifMAC := vifMACFromUUIDs(uuid.FromStringOrNil(appUUID), uuid.FromStringOrNil(niUUID), adapterNum)
+ 		ethName := fmt.Sprintf("eth%d", virtIntfOrder-1)
+ 		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+@@ -406,14 +538,17 @@ func main() {
+ 			InterfaceOrder: virtIntfOrder,
+ 			MacAddress:     vifMAC.String(),
+ 		})
++		if recordSwitchMAC {
++			switchVIFMACs = append(switchVIFMACs, vifMAC.String())
++		}
+ 		virtIntfOrder++
+ 	}
+ 
+ 	if *uplink != "" {
+-		addVIF(natNIUUID, 1)
++		addVIF(natNIUUID, 1, false)
+ 	}
+ 	for i, sni := range switchNIs {
+-		addVIF(sni.niUUID, uint8(i+2))
++		addVIF(sni.niUUID, uint8(i+2), true)
+ 	}
+ 
+ 	// DeviceIoList: tell EVE about PCIe-assignable adapters.
+@@ -443,32 +578,145 @@ func main() {
+ 	}
+ 
+ 	if hasPCIe && lmp != "" {
+-		// Add LMP port as a managed PhysicalIO so NIM can build DevicePortConfig for it.
+-		lmpNetUUID := uuid.NewV5(ns, *name+"/lmp-network").String()
++		// In passthrough mode SystemAdapterList becomes the authoritative
++		// list of ports NIM manages — anything NOT listed becomes invisible
++		// to zedrouter. We therefore must declare:
++		//   1. The actual management uplink (Uplink=true, with DHCP) — so
++		//      EVE itself has outbound connectivity for control-plane.
++		//      Identity comes from mgmtUplink (the QEMU profile sets
++		//      this to `eth0`, the first virtio NIC = 192.168.1.0/24).
++		//   2. The LMP port (Uplink=false) — used by the LMP Switch NI as
++		//      a non-uplink bridge member. NOT a management uplink despite
++		//      its name.
++		//   3. Each remaining switch-type interface (Uplink=false) — port
++		//      for its Switch NI. Added in the loop below.
++		// PCIe ports are declared with Usage=PhyIoUsageDedicated which keeps
++		// them out of NIM's DPC (per patch 0016).
++		if mgmtUplink == "" {
++			log.Fatalf("hasPCIe + lmp set: profile must declare 'mgmt_uplink:' so EVE's management uplink is preserved (otherwise EVE has no outbound network)")
++		}
++		mgmtNetUUID := uuid.NewV5(ns, *name+"/mgmt-network").String()
+ 		deviceIoList = append(deviceIoList, &zconfig.PhysicalIO{
+ 			Ptype:        evecommon.PhyIoType_PhyIoNetEth,
+-			Phylabel:     lmp,
+-			Logicallabel: lmp,
++			Phylabel:     mgmtUplink,
++			Logicallabel: mgmtUplink,
+ 			Phyaddrs: map[string]string{
+-				"Ifname": lmp,
++				"Ifname": mgmtUplink,
+ 			},
+ 			Usage: evecommon.PhyIoMemberUsage_PhyIoUsageMgmtAndApps,
+ 		})
+-		// DHCP network config for the LMP port.
+ 		networks = append(networks, &zconfig.NetworkConfig{
+-			Id:   lmpNetUUID,
++			Id:   mgmtNetUUID,
+ 			Type: evecommon.NetworkType_V4Only,
+ 			Ip:   &evecommon.Ipspec{Dhcp: evecommon.DHCPType_Client},
+ 		})
+-		// Tell NIM to manage ONLY the LMP port; PCIe adapters are excluded.
+ 		systemAdapters = append(systemAdapters, &zconfig.SystemAdapter{
+-			Name:           lmp,
++			Name:           mgmtUplink,
+ 			Uplink:         true,
+-			NetworkUUID:    lmpNetUUID,
+-			LowerLayerName: lmp,
++			NetworkUUID:    mgmtNetUUID,
++			LowerLayerName: mgmtUplink,
+ 			Cost:           0,
+ 		})
+-		log.Printf("PCIe passthrough mode: NIM will manage only %s; PCIe adapters excluded from DevicePortConfig", lmp)
++		// LMP port: bridge member of the LMP Switch NI; not an uplink.
++		deviceIoList = append(deviceIoList, &zconfig.PhysicalIO{
++			Ptype:        evecommon.PhyIoType_PhyIoNetEth,
++			Phylabel:     lmp,
++			Logicallabel: lmp,
++			Phyaddrs: map[string]string{
++				"Ifname": lmp,
++			},
++			Usage: evecommon.PhyIoMemberUsage_PhyIoUsageShared,
++		})
++		systemAdapters = append(systemAdapters, &zconfig.SystemAdapter{
++			Name:           lmp,
++			Uplink:         false,
++			LowerLayerName: lmp,
++		})
++		// Switch-NI ports also need to be visible to NIM so zedrouter can
++		// resolve `Port: <name>` on each Switch NetworkInstanceConfig. When
++		// SystemAdapterList is present it's exhaustive — anything not listed
++		// is invisible. Mark each switch port as non-uplink (no mgmt traffic,
++		// no NetworkUUID) and Shared usage in PhysicalIO so NIM still puts
++		// them in DeviceNetworkStatus but doesn't probe them for connectivity.
++		for _, iface := range profileInterfaces {
++			if strings.ToLower(iface.Type) != "switch" {
++				continue
++			}
++			deviceIoList = append(deviceIoList, &zconfig.PhysicalIO{
++				Ptype:        evecommon.PhyIoType_PhyIoNetEth,
++				Phylabel:     iface.Name,
++				Logicallabel: iface.Name,
++				Phyaddrs: map[string]string{
++					"Ifname": iface.Name,
++				},
++				Usage: evecommon.PhyIoMemberUsage_PhyIoUsageShared,
++			})
++			systemAdapters = append(systemAdapters, &zconfig.SystemAdapter{
++				Name:           iface.Name,
++				Uplink:         false,
++				LowerLayerName: iface.Name,
++			})
++		}
++		log.Printf("PCIe passthrough mode: NIM mgmt uplink %s, LMP %s + switch ports as non-uplinks; PCIe adapters excluded from DevicePortConfig", mgmtUplink, lmp)
++	}
++
++	// Build a desired ethN → MAC map covering every interface we want VyOS
++	// to see at a deterministic name, regardless of which driver Linux
++	// probes first. The map is emitted into cidata as a cloud-init
++	// `bootcmd:` block — a tiny shell snippet that swaps kernel ifnames to
++	// match. `bootcmd` runs at every boot in the `cloud-init-local` stage,
++	// which fires before `vyos-router.service` starts, so the rename is in
++	// place before any conf_mode script looks at /sys/class/net.
++	//
++	// Why bootcmd instead of VyOS's canonical hw-id mechanism: VyOS's udev
++	// rename (vyos_net_name) is gated on /run/vyos-config_status, so by the
++	// time cloud-init runs vyos_config_commands the gate is already closed.
++	// hw-id settings made via cidata commit cleanly but never trigger a
++	// rename, so on a fresh first boot the kernel ifnames stay in driver
++	// probe order. With bootcmd we skip the gate and rename directly.
++	if vyosCfg != nil {
++		vyosCfg.EthHwIds = make(map[string]string)
++		// LMP-named guest interface (vyos.lmp_name) gets the LMP NI VIF
++		// MAC. This is the interface that lives on EVE's LMP bridge
++		// (profile.lmp); VyOS configures it as the LAN-side bridge member
++		// and serves DHCP on it. vyos.lan typically lists the same name
++		// (lmp_name == lan[0] is the common single-NI case).
++		if vyosCfg.LMPName != "" && lmpMACStr != "" {
++			vyosCfg.EthHwIds[vyosCfg.LMPName] = lmpMACStr
++		}
++		// Remaining VyOS-managed names (vyos.wan plus any additional
++		// vyos.lan entries) map to switch-NI VIF MACs in profile.interfaces
++		// order. A name already pinned to the LMP MAC above is silently
++		// skipped, so the common lmp_name == lan[0] case is naturally
++		// idempotent.
++		switchIdx := 0
++		assignSwitch := func(name string) {
++			if name == "" || vyosCfg.EthHwIds[name] != "" {
++				return
++			}
++			if switchIdx < len(switchVIFMACs) {
++				vyosCfg.EthHwIds[name] = switchVIFMACs[switchIdx]
++				switchIdx++
++			}
++		}
++		assignSwitch(vyosCfg.WAN)
++		for _, lanEth := range vyosCfg.LAN {
++			assignSwitch(lanEth)
++		}
++		// PCIe passthrough adapters: take the next free ethN beyond what
++		// the VIF assignments above used. profile.interfaces[i].mac must be
++		// set (QEMU runs: explicit `mac=` on the e1000e device line; real
++		// hardware: read from the NIC EEPROM ahead of time).
++		used := len(vyosCfg.EthHwIds)
++		pcieIdx := 0
++		for _, iface := range profileInterfaces {
++			if strings.ToLower(iface.Type) != "pcie" || iface.Mac == "" {
++				continue
++			}
++			eth := fmt.Sprintf("eth%d", used+pcieIdx)
++			vyosCfg.EthHwIds[eth] = iface.Mac
++			pcieIdx++
++		}
+ 	}
+ 
+ 	cloudInitUserData := generateVyOSUserData(vyosCfg)
+-- 
+2.51.0
+

@@ -1,0 +1,78 @@
+From 5036db4a3699cf8c7388d82add9895e5be16dc7e Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Fri, 6 Mar 2026 13:00:39 +0000
+Subject: [PATCH] zedagent: fix LOC bootstrap for localhost URLs
+
+SendOnAllIntf binds HTTP connections to specific management interface
+IPs (eth0, eth1). A LOC URL of http://localhost:8888 is unreachable
+this way since 127.0.0.1 is only accessible via the loopback interface.
+
+Replace localhost/127.0.0.1 in the bootstrapped LOC URL with the first
+available management interface IP so LPS (listening on 0.0.0.0:8888)
+is reachable via a management port. If no management IP is available
+yet (NIM still starting), the bootstrap defers to the next config
+interval retry.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/zedagent/handleconfig.go | 37 +++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/pillar/cmd/zedagent/handleconfig.go b/pkg/pillar/cmd/zedagent/handleconfig.go
+index c33975c0c..6c0f788ba 100644
+--- a/pkg/pillar/cmd/zedagent/handleconfig.go
++++ b/pkg/pillar/cmd/zedagent/handleconfig.go
+@@ -882,11 +882,18 @@ func getLatestConfig(getconfigCtx *getconfigContext, iteration int,
+ 	// Bootstrap LOC URL from /config/loc/url when the controller is unreachable
+ 	// and no LOC URL has been provisioned by the controller yet.
+ 	// This allows airgap/dev deployments to use a local LOC without a cloud controller.
++	//
++	// SendOnAllIntf binds to management interface IPs (eth0, eth1), so a URL with
++	// "localhost" or "127.0.0.1" is unreachable that way. Replace with the first
++	// available management interface IP so LPS (listening on 0.0.0.0) is reachable.
+ 	if rv != configOK && getconfigCtx.locConfig == nil {
+ 		if data, err := os.ReadFile("/config/loc/url"); err == nil {
+ 			if locURL := strings.TrimSpace(string(data)); locURL != "" {
+-				log.Noticef("getLatestConfig: bootstrapping LOC URL from /config/loc/url: %s", locURL)
+-				getconfigCtx.locConfig = &types.LOCConfig{LocURL: locURL}
++				locURL = replaceLocalhostWithMgmtIP(locURL)
++				if locURL != "" {
++					log.Noticef("getLatestConfig: bootstrapping LOC URL from /config/loc/url: %s", locURL)
++					getconfigCtx.locConfig = &types.LOCConfig{LocURL: locURL}
++				}
+ 			}
+ 		}
+ 	}
+@@ -1221,3 +1228,29 @@ func publishConfigNetdump(ctx *zedagentContext,
+ 	}
+ 	ctx.lastConfigNetdumpPub = time.Now()
+ }
++
++// replaceLocalhostWithMgmtIP replaces "localhost" or "127.0.0.1" in a URL with
++// the first available management interface IP. SendOnAllIntf binds to management
++// interface IPs, making loopback addresses unreachable. Returns empty string if
++// no management IP is available yet (caller should retry later).
++func replaceLocalhostWithMgmtIP(locURL string) string {
++	if !strings.Contains(locURL, "localhost") && !strings.Contains(locURL, "127.0.0.1") {
++		return locURL
++	}
++	for _, port := range deviceNetworkStatus.Ports {
++		if !port.IsMgmt {
++			continue
++		}
++		for _, addrInfo := range port.AddrInfoList {
++			if addrInfo.Addr.IsGlobalUnicast() {
++				ip := addrInfo.Addr.String()
++				locURL = strings.ReplaceAll(locURL, "localhost", ip)
++				locURL = strings.ReplaceAll(locURL, "127.0.0.1", ip)
++				return locURL
++			}
++		}
++	}
++	// No management IP available yet — caller will retry on next config interval.
++	log.Noticef("replaceLocalhostWithMgmtIP: no management interface IP available yet")
++	return ""
++}
+-- 
+2.51.0
+

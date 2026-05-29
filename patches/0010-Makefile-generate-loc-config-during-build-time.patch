@@ -1,0 +1,56 @@
+From bcc2f6e9e350343d3aa3eea650c2e717ccfaee6a Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 10 Mar 2026 10:40:09 +0000
+Subject: [PATCH] Makefile: generate loc config during build time
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ Makefile | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 66456457b..dce5cb294 100644
+--- a/Makefile
++++ b/Makefile
+@@ -232,6 +232,11 @@ DEVICETREE_DTB_arm64=$(DIST)/dtb/eve.dtb
+ DEVICETREE_DTB=$(DEVICETREE_DTB_$(ZARCH))
+ 
+ CONF_FILES=$(shell ls -d $(CONF_DIR)/*)
++# Profile for gen-loc-config (default: qemu; override with LPS_PROFILE=ms-01 etc.)
++LPS_PROFILE ?= qemu
++GEN_LOC_CONFIG := $(BUILDTOOLS_BIN)/gen-loc-config
++LPS_PROFILE_FILE := profiles/$(LPS_PROFILE).yml
++LOC_CONFIG_BIN := $(CONF_DIR)/lps/loc-config.bin
+ LIVE_PART_SPEC=$(if $(findstring evaluation,$(PLATFORM)), efi conf imga imgb imgc, efi conf imga)
+ 
+ # parallels settings
+@@ -794,7 +799,7 @@ $(SSH_KEY):
+ 	ssh-keygen -P "" -f $@
+ 	mv $@.pub $(CONF_DIR)/authorized_keys
+ 
+-$(CONFIG_IMG): $(CONF_FILES) | $(INSTALLER)
++$(CONFIG_IMG): $(LOC_CONFIG_BIN) $(CONF_FILES) | $(INSTALLER)
+ 	./tools/makeconfig.sh $@ "$(ROOTFS_VERSION)" $(CONF_FILES)
+ 	$(QUIET): $@: Succeeded
+ 
+@@ -886,6 +891,17 @@ $(COMPARESOURCES):
+ 	@echo Done building packages
+ 	$(QUIET): $@: Succeeded
+ 
++$(GEN_LOC_CONFIG): $(GOTREE)/cmd/gen-loc-config/main.go
++	$(QUIET): $@: Begin
++	cd $(GOTREE) && GOOS=$(LOCAL_GOOS) CGO_ENABLED=0 go build -mod=vendor -o $@ ./cmd/gen-loc-config/
++	$(QUIET): $@: Succeeded
++
++$(LOC_CONFIG_BIN): $(GEN_LOC_CONFIG) $(LPS_PROFILE_FILE)
++	$(QUIET): $@: Begin
++	mkdir -p $(dir $@)
++	$(GEN_LOC_CONFIG) -profile $(LPS_PROFILE_FILE)
++	$(QUIET): $@: Succeeded
++
+ compare_sbom_collected_sources: $(SBOM) $(COLLECTED_SOURCES) $(COMPARESOURCES)
+ 	$(QUIET): $@: Begin
+ 	$(COMPARESOURCES) $(COLLECTED_SOURCES):./collected_sources_manifest.csv $<
+-- 
+2.51.0
+

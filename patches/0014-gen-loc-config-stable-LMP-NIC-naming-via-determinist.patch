@@ -1,0 +1,195 @@
+From b4fde427080942d70b79ed4bd936e49f8bae92c1 Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Wed, 11 Mar 2026 10:39:56 +0000
+Subject: [PATCH] gen-loc-config: stable LMP NIC naming via deterministic
+ MAC and VyOS hw-id
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The VirtIO LMP NIC receives a random ethN name inside VyOS because it
+races with PCIe passthrough NICs for low-numbered PCI slots at guest
+boot, making the LMP interface unreachable under a predictable name.
+
+Fix with three coordinated changes:
+
+1. Assign a deterministic, static MAC to the LMP NetworkAdapter.
+   The MAC is derived from the app and LMP NI UUIDs via SHA-256
+   (02:16:3E OUI, matching EVE's switch-NI convention) and does not
+   include EVE's runtime AppNum, so it is stable across reinstalls.
+
+2. Place LMP first in the VM interface list (InterfaceOrder=1,
+   Name="eth0"). VirtIO NICs always receive lower guest PCI addresses
+   than PCIe passthrough devices, so LMP deterministically becomes eth0
+   inside the guest kernel. PCIe adapters shift to InterfaceOrder 2..N+1;
+   other VirtIO NICs (uplink, switch NIs) start at N+2.
+
+3. Emit VyOS hw-id bindings in cloud-init user-data. The LMP is bound
+   as eth100 (well clear of PCIe eth0–eth3, and a valid ethN name that
+   VyOS recognises as a regular ethernet interface). VyOS generates a
+   udev rule from hw-id entries that renames the NIC on boot. Also emit
+   "delete interfaces ethernet <WAN> hw-id" after setting the WAN
+   address to remove the MAC lock VyOS auto-records for the WAN
+   interface, preventing a rename conflict when LMP happens to be the
+   WAN NIC on first boot.
+
+Add an optional vyos.lmp_name profile field (default "eth100") so the
+LMP interface name can be overridden per-profile. Update ms-01.yml to
+reflect the new interface mapping inside VyOS:
+  eth0    -> VirtIO LMP (renamed to eth100 via hw-id)
+  eth1    -> host eth3 / PCIe 2.5G WAN  (0000:58:00.0)
+  eth2    -> host eth0 / PCIe 10G LAN   (0000:02:00.0)
+  eth3    -> host eth1 / PCIe 10G LAN   (0000:02:00.1)
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 93 ++++++++++++++++++++-------
+ 1 file changed, 69 insertions(+), 24 deletions(-)
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+index 1398eeeea..a8194e2e5 100644
+--- a/pkg/pillar/cmd/gen-loc-config/main.go
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -77,6 +77,13 @@ type VyOSConfig struct {
+ 	NameServers []string `yaml:"name_servers"` // DNS servers pushed to DHCP clients
+ 	CIOutput    string   `yaml:"ci_output"`    // output path for the cloud-init ISO
+ 	Commands    []string `yaml:"commands"`     // additional VyOS set commands appended last
++	// LMPName is the interface name VyOS will use for the LMP virtio NIC.
++	// VyOS renames the NIC (via a udev hw-id rule) to this name on boot.
++	// Defaults to "eth100" if not set.
++	LMPName string `yaml:"lmp_name"`
++	// HWIDs maps VyOS interface names to MAC addresses for hw-id binding.
++	// Populated automatically by gen-loc-config; no need to set in the profile.
++	HWIDs map[string]string `yaml:"-"`
+ }
+ 
+ // Profile describes a compile-time machine configuration loaded from a YAML file.
+@@ -138,6 +145,12 @@ func generateVyOSUserData(vyosCfg *VyOSConfig) string {
+ 		add("set system host-name '" + v.Hostname + "'")
+ 	}
+ 
++	// hw-id bindings: pin each interface name to its MAC address so VyOS
++	// finds the right NIC regardless of PCI enumeration order.
++	for iface, mac := range v.HWIDs {
++		add("set interfaces ethernet " + iface + " hw-id '" + mac + "'")
++	}
++
+ 	// WAN interface: DHCP client
+ 	add("set interfaces ethernet " + v.WAN + " description 'WAN'")
+ 	add("set interfaces ethernet " + v.WAN + " address 'dhcp'")
+@@ -324,7 +337,7 @@ func main() {
+ 			pcieAdapters = append(pcieAdapters, &zconfig.Adapter{
+ 				Type:           evecommon.PhyIoType_PhyIoNetEth,
+ 				Name:           iface.Name,
+-				InterfaceOrder: uint32(len(pcieAdapters) + 1),
++				InterfaceOrder: uint32(len(pcieAdapters) + 2),
+ 			})
+ 		default:
+ 			log.Fatalf("unknown interface type %q for %s (use 'switch' or 'pcie')", iface.Type, iface.Name)
+@@ -332,34 +345,21 @@ func main() {
+ 	}
+ 
+ 	// --- App interfaces (virtual NICs) ---
+-	// When PCIe adapters are present, EnforceNetworkInterfaceOrder is enabled so that
+-	// PCIe network devices (InterfaceOrder 1..N) are placed before virtual NICs on the
+-	// guest PCI bus, making them appear as lower ethN indices (WAN first).
+-	// Virtual NICs continue numbering from N+1, with LMP always last.
++	// VirtIO NICs always receive lower guest PCI addresses than PCIe passthrough devices
++	// (virtio: 0x00:XX.0, passthrough: host PCI addr e.g. 0x02:00.0), so inside the guest
++	// Linux names them eth0, eth1, ... ahead of the PCIe NICs.
++	// LMP is always placed first (InterfaceOrder=1) so it deterministically gets eth0
++	// inside the guest, where VyOS renames it to eth100 via hw-id binding.
++	// Other VirtIO NICs (uplink, switch NIs) follow at InterfaceOrder len(pcieAdapters)+2 onward.
+ 	var appInterfaces []*zconfig.NetworkAdapter
+-	virtIntfOrder := uint32(len(pcieAdapters) + 1)
+ 
+-	if *uplink != "" {
+-		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+-			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
+-			NetworkId:      natNIUUID,
+-			InterfaceOrder: virtIntfOrder,
+-		})
+-		virtIntfOrder++
+-	}
+-	for _, sni := range switchNIs {
+-		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+-			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
+-			NetworkId:      sni.niUUID,
+-			InterfaceOrder: virtIntfOrder,
+-		})
+-		virtIntfOrder++
+-	}
+ 	if lmp != "" {
++		lmpMAC := lmpMACFromUUIDs(uuid.FromStringOrNil(appUUID), uuid.FromStringOrNil(lmpNIUUID))
+ 		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
+-			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
++			Name:           "eth0",
+ 			NetworkId:      lmpNIUUID,
+-			InterfaceOrder: virtIntfOrder,
++			InterfaceOrder: 1,
++			MacAddress:     lmpMAC.String(),
+ 			Acls: []*zconfig.ACE{
+ 				{
+ 					Name: "allow-all",
+@@ -372,6 +372,35 @@ func main() {
+ 				},
+ 			},
+ 		})
++		if vyosCfg != nil {
++			if vyosCfg.HWIDs == nil {
++				vyosCfg.HWIDs = make(map[string]string)
++			}
++			lmpVyOSName := vyosCfg.LMPName
++			if lmpVyOSName == "" {
++				lmpVyOSName = "eth100"
++			}
++			vyosCfg.HWIDs[lmpVyOSName] = lmpMAC.String()
++		}
++	}
++
++	// Non-LMP VirtIO NICs follow after LMP (slot 1) and PCIe slots (2..len+1).
++	virtIntfOrder := uint32(len(pcieAdapters) + 2)
++
++	if *uplink != "" {
++		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
++			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
++			NetworkId:      natNIUUID,
++			InterfaceOrder: virtIntfOrder,
++		})
++		virtIntfOrder++
++	}
++	for _, sni := range switchNIs {
++		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
++			Name:           fmt.Sprintf("eth%d", virtIntfOrder-1),
++			NetworkId:      sni.niUUID,
++			InterfaceOrder: virtIntfOrder,
++		})
+ 		virtIntfOrder++
+ 	}
+ 
+@@ -537,6 +566,22 @@ func main() {
+ 	}
+ }
+ 
++// lmpMACFromUUIDs computes a deterministic MAC address for the LMP virtual NIC.
++// The MAC is derived from the app and LMP network-instance UUIDs using SHA-256,
++// matching the OUI (02:16:3E) that EVE uses for switch-NI virtual NICs.
++// Unlike EVE's runtime MAC generation it does not include the per-device AppNum,
++// so the result is stable across reinstalls and independent of runtime state.
++// Setting this MAC explicitly in the NetworkAdapter config causes EVE to use it
++// instead of its own generated value.
++func lmpMACFromUUIDs(appUUID, lmpNIUUID uuid.UUID) net.HardwareAddr {
++	h := sha256.New()
++	h.Write(appUUID[:])
++	h.Write(lmpNIUUID[:])
++	h.Write([]byte{0}) // adapterNum = 0 (LMP is the only virtual NIC)
++	hash := h.Sum(nil)
++	return net.HardwareAddr{0x02, 0x16, 0x3e, hash[0], hash[1], hash[2]}
++}
++
+ // splitImageURL splits a full image URL into the datastore base URL and filename.
+ func splitImageURL(rawURL string) (base, file string) {
+ 	for _, scheme := range []string{"https://", "http://"} {
+-- 
+2.51.0
+

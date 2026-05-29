@@ -1,0 +1,520 @@
+From 1dc81a58c2b47c2aa669d75bce8533e6a4889b8b Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Tue, 10 Mar 2026 09:20:22 +0000
+Subject: [PATCH] gen-loc-config: add LOC config generator tool with profile
+ support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add pkg/pillar/cmd/gen-loc-config, a CLI tool that generates a
+ConfigResponse proto binary (loc-config.bin) for use as the LOC
+compound-config inner payload served by the LPS server.
+
+The tool produces a minimal EdgeDevConfig containing one KVM VM that
+boots from an HTTP-served disk image. It can be driven by flags or a
+YAML machine profile. UUIDs are derived deterministically from the VM
+name so repeated runs produce identical output.
+
+Networking supports three modes that can be combined:
+  - NAT network instance via an EVE uplink port (-uplink / network.uplink)
+  - LMP (Local Management Port): Switch (L2 bridge) NI; VM gets eth0
+  - Additional interfaces per-profile: type switch (Switch NI) or
+    type pcie (PCIe passthrough via AppInstanceConfig.Adapters)
+
+When PCIe adapters are present alongside an LMP port, a SystemAdapterList
+is emitted so NIM manages only the LMP port and does not treat PCIe
+adapters as uplinks (which would block passthrough assignment).
+
+Also add two reference profiles:
+  profiles/ms-01.yml  — MS-01 mini PC: three PCIe-passthrough ports +
+                        one LMP Switch NI; targets the bundled VyOS image
+  profiles/qemu.yml   — QEMU testing: Switch NIs only, no PCIe passthrough
+
+The tool omits Id from EdgeDevConfig so inhaleDeviceConfig skips the
+device-UUID check (LOC configs are served locally and carry no device
+identity assertion).
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/cmd/gen-loc-config/main.go | 468 ++++++++++++++++++++++++++
+ 1 file changed, 468 insertions(+)
+ create mode 100644 pkg/pillar/cmd/gen-loc-config/main.go
+
+diff --git a/pkg/pillar/cmd/gen-loc-config/main.go b/pkg/pillar/cmd/gen-loc-config/main.go
+new file mode 100644
+index 000000000..30dd3ecb6
+--- /dev/null
++++ b/pkg/pillar/cmd/gen-loc-config/main.go
+@@ -0,0 +1,468 @@
++// gen-loc-config generates a ConfigResponse proto binary suitable for use as
++// the LOC compound-config inner payload (loc-config.bin served by the LPS server).
++//
++// It produces a minimal EdgeDevConfig containing one KVM virtual machine
++// that boots from a disk image served over HTTP.
++//
++// Usage (profile):
++//
++//	go run ./cmd/gen-loc-config -profile profiles/ms-01.yml
++//
++// Usage (flags):
++//
++//	go run ./cmd/gen-loc-config \
++//	  -name my-vm \
++//	  -image-url http://192.0.2.1:8888/images/disk.qcow2 \
++//	  -image-format qcow2 \
++//	  -image-size-bytes 789315584 \
++//	  -uplink eth0 \
++//	  -vnc \
++//	  -memory-mb 512 \
++//	  -cpus 1 \
++//	  -output /tmp/loc-config.bin
++//
++// The output file should be placed at /config/lps/loc-config.bin on the EVE
++// device (remount /config rw first, then remount ro).
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"flag"
++	"fmt"
++	"log"
++	"os"
++	"strings"
++
++	zconfig "github.com/lf-edge/eve-api/go/config"
++	evecommon "github.com/lf-edge/eve-api/go/evecommon"
++	uuid "github.com/satori/go.uuid"
++	"google.golang.org/protobuf/proto"
++	"gopkg.in/yaml.v3"
++)
++
++// ProfileInterface describes a single interface passed to the VM.
++// type: "switch" creates a Switch (L2 bridge) network instance — use in QEMU
++//
++//	or when EVE visibility of the port is needed.
++//
++// type: "pcie"   assigns the physical PCIe device directly to the VM — use on
++//
++//	real hardware for wire-speed forwarding.
++//
++// For pcie, PciLong and AssignGrp are required (from the device's controller-model.json).
++type ProfileInterface struct {
++	Name      string `yaml:"name"`
++	Type      string `yaml:"type"`      // "switch" or "pcie"
++	PciLong   string `yaml:"pci"`       // PCI address e.g. "0000:02:00.0" (pcie only)
++	AssignGrp string `yaml:"assigngrp"` // IOMMU group e.g. "group14" (pcie only)
++}
++
++// Profile describes a compile-time machine configuration loaded from a YAML file.
++type Profile struct {
++	Name  string `yaml:"name"`
++	Image struct {
++		URL    string `yaml:"url"`
++		SHA256 string `yaml:"sha256"`
++		Format string `yaml:"format"`
++		Size   int64  `yaml:"size"`
++	} `yaml:"image"`
++	VM struct {
++		MemoryMB int  `yaml:"memory_mb"`
++		CPUs     int  `yaml:"cpus"`
++		VNC      bool `yaml:"vnc"`
++	} `yaml:"vm"`
++	// Network (optional): NAT network instance via an EVE uplink.
++	// Omit when all ports are handed off to the VM via lmp/interfaces.
++	Network struct {
++		Uplink  string `yaml:"uplink"`
++		Subnet  string `yaml:"subnet"`
++		Gateway string `yaml:"gateway"`
++	} `yaml:"network"`
++	// LMP (Local Management Port): bridged to a Switch NI; VM gets eth0 on it.
++	LMP string `yaml:"lmp"`
++	// Interfaces: additional ports handed to the VM in order (eth1, eth2, …).
++	// type: switch → Switch NI (L2 bridge); type: pcie → PCIe passthrough.
++	Interfaces []ProfileInterface `yaml:"interfaces"`
++	VNCPasswd  string             `yaml:"vnc_passwd"`
++	SSHKey     string             `yaml:"ssh_key"`
++	Output     string             `yaml:"output"`
++}
++
++func loadProfile(path string) (*Profile, error) {
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("read profile: %w", err)
++	}
++	var p Profile
++	if err := yaml.Unmarshal(data, &p); err != nil {
++		return nil, fmt.Errorf("parse profile: %w", err)
++	}
++	return &p, nil
++}
++
++func main() {
++	profilePath := flag.String("profile", "", "Path to a YAML machine profile (overrides individual flags)")
++	name := flag.String("name", "loc-vm", "VM display name")
++	imageURL := flag.String("image-url", "", "HTTP URL of the disk image (required)")
++	imageFormat := flag.String("image-format", "qcow2", "Disk image format: raw, qcow2, vhd, vmdk")
++	imageSizeBytes := flag.Int64("image-size-bytes", 4096*1024*1024, "Maximum image/volume size in bytes")
++	imageSHA256 := flag.String("image-sha256", "", "SHA256 hex digest of the disk image (required by volumemgr)")
++	memoryMB := flag.Uint("memory-mb", 512, "VM memory in MiB")
++	cpus := flag.Uint("cpus", 1, "Number of vCPUs")
++	vncPasswd := flag.String("vnc-passwd", "", "VNC password for the VM console")
++	sshKey := flag.String("ssh-key", "", "SSH public key to authorize on the EVE device (sets debug.enable.ssh)")
++	enableVNC := flag.Bool("vnc", false, "Enable VNC console on display 1")
++	uplink := flag.String("uplink", "", "EVE uplink port name for the NAT network instance")
++	niSubnet := flag.String("ni-subnet", "192.168.100.0/24", "NAT network instance subnet (CIDR)")
++	niGateway := flag.String("ni-gateway", "192.168.100.1", "NAT network instance gateway IP")
++	output := flag.String("output", "loc-config.bin", "Output file path")
++	flag.Parse()
++
++	// Profile fields that have no flag equivalents.
++	var lmp string
++	var profileInterfaces []ProfileInterface
++
++	// If a profile is given, load it and override all parameters.
++	if *profilePath != "" {
++		p, err := loadProfile(*profilePath)
++		if err != nil {
++			log.Fatalf("load profile %s: %v", *profilePath, err)
++		}
++		*name = p.Name
++		*imageURL = p.Image.URL
++		*imageSHA256 = p.Image.SHA256
++		*imageFormat = p.Image.Format
++		*imageSizeBytes = p.Image.Size
++		*memoryMB = uint(p.VM.MemoryMB)
++		*cpus = uint(p.VM.CPUs)
++		*enableVNC = p.VM.VNC
++		*uplink = p.Network.Uplink
++		*niSubnet = p.Network.Subnet
++		*niGateway = p.Network.Gateway
++		*vncPasswd = p.VNCPasswd
++		*sshKey = p.SSHKey
++		lmp = p.LMP
++		profileInterfaces = p.Interfaces
++		if p.Output != "" {
++			*output = p.Output
++		}
++	}
++
++	if *imageURL == "" {
++		fmt.Fprintln(os.Stderr, "error: -image-url is required (or set image.url in profile)")
++		flag.Usage()
++		os.Exit(1)
++	}
++
++	format, err := parseFormat(*imageFormat)
++	if err != nil {
++		log.Fatalf("invalid image format: %v", err)
++	}
++
++	// Generate stable UUIDs derived from the VM name so re-runs are idempotent.
++	ns := uuid.NewV5(uuid.NamespaceDNS, "gen-loc-config.eve.lf-edge.org")
++	dsUUID := uuid.NewV5(ns, *name+"/datastore").String()
++	ctUUID := uuid.NewV5(ns, *name+"/content-tree").String()
++	volUUID := uuid.NewV5(ns, *name+"/volume").String()
++	appUUID := uuid.NewV5(ns, *name+"/app").String()
++
++	sizeBytes := *imageSizeBytes
++	dsBase, ctFile := splitImageURL(*imageURL)
++
++	var configItems []*zconfig.ConfigItem
++	if *sshKey != "" {
++		configItems = append(configItems, &zconfig.ConfigItem{
++			Key:   "debug.enable.ssh",
++			Value: *sshKey,
++		})
++	}
++
++	// --- Network instances ---
++	var networkInstances []*zconfig.NetworkInstanceConfig
++
++	// NAT network instance (optional — only when uplink is set).
++	natNIUUID := uuid.NewV5(ns, *name+"/network-instance").String()
++	if *uplink != "" {
++		networkInstances = append(networkInstances, &zconfig.NetworkInstanceConfig{
++			Uuidandversion: &zconfig.UUIDandVersion{Uuid: natNIUUID, Version: "1"},
++			Displayname:    *name + "-nat",
++			InstType:       zconfig.ZNetworkInstType_ZnetInstLocal,
++			Activate:       true,
++			Port:           &zconfig.Adapter{Name: *uplink},
++			Ip: &evecommon.Ipspec{
++				Dhcp:    evecommon.DHCPType_DHCPNoop,
++				Subnet:  *niSubnet,
++				Gateway: *niGateway,
++			},
++		})
++	}
++
++	// LMP: Switch (L2 bridge) network instance.
++	lmpNIUUID := uuid.NewV5(ns, *name+"/lmp-ni").String()
++	if lmp != "" {
++		networkInstances = append(networkInstances, &zconfig.NetworkInstanceConfig{
++			Uuidandversion: &zconfig.UUIDandVersion{Uuid: lmpNIUUID, Version: "1"},
++			Displayname:    *name + "-lmp",
++			InstType:       zconfig.ZNetworkInstType_ZnetInstSwitch,
++			Activate:       true,
++			Port:           &zconfig.Adapter{Name: lmp},
++		})
++	}
++
++	// Additional interfaces: Switch NIs or PCIe adapters.
++	type switchNI struct {
++		niUUID string
++		port   string
++	}
++	var switchNIs []switchNI
++	var pcieAdapters []*zconfig.Adapter
++
++	for i, iface := range profileInterfaces {
++		switch strings.ToLower(iface.Type) {
++		case "switch":
++			niID := uuid.NewV5(ns, fmt.Sprintf("%s/iface-ni-%d", *name, i)).String()
++			networkInstances = append(networkInstances, &zconfig.NetworkInstanceConfig{
++				Uuidandversion: &zconfig.UUIDandVersion{Uuid: niID, Version: "1"},
++				Displayname:    fmt.Sprintf("%s-iface-%s", *name, iface.Name),
++				InstType:       zconfig.ZNetworkInstType_ZnetInstSwitch,
++				Activate:       true,
++				Port:           &zconfig.Adapter{Name: iface.Name},
++			})
++			switchNIs = append(switchNIs, switchNI{niUUID: niID, port: iface.Name})
++		case "pcie":
++			if iface.PciLong == "" || iface.AssignGrp == "" {
++				log.Fatalf("interface %s: pcie type requires 'pci' and 'assigngrp' fields in profile", iface.Name)
++			}
++			pcieAdapters = append(pcieAdapters, &zconfig.Adapter{
++				Type: evecommon.PhyIoType_PhyIoNetEth,
++				Name: iface.Name,
++			})
++		default:
++			log.Fatalf("unknown interface type %q for %s (use 'switch' or 'pcie')", iface.Type, iface.Name)
++		}
++	}
++
++	// --- App interfaces (virtual NICs) ---
++	// Order: NAT (if set) → switch interfaces → LMP (last)
++	var appInterfaces []*zconfig.NetworkAdapter
++	vmEthIdx := 0
++
++	if *uplink != "" {
++		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
++			Name:      fmt.Sprintf("eth%d", vmEthIdx),
++			NetworkId: natNIUUID,
++		})
++		vmEthIdx++
++	}
++	for _, sni := range switchNIs {
++		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
++			Name:      fmt.Sprintf("eth%d", vmEthIdx),
++			NetworkId: sni.niUUID,
++		})
++		vmEthIdx++
++	}
++	if lmp != "" {
++		appInterfaces = append(appInterfaces, &zconfig.NetworkAdapter{
++			Name:      fmt.Sprintf("eth%d", vmEthIdx),
++			NetworkId: lmpNIUUID,
++		})
++		vmEthIdx++
++	}
++
++	// DeviceIoList: tell EVE about PCIe-assignable adapters.
++	// When PCIe adapters are present we also add a SystemAdapterList so that
++	// NIM only manages the LMP port and does NOT treat PCIe adapters as
++	// network ports (which would block passthrough with "is a zedrouter port").
++	var deviceIoList []*zconfig.PhysicalIO
++	var systemAdapters []*zconfig.SystemAdapter
++	var networks []*zconfig.NetworkConfig
++
++	hasPCIe := false
++	for _, iface := range profileInterfaces {
++		if strings.ToLower(iface.Type) == "pcie" {
++			hasPCIe = true
++			deviceIoList = append(deviceIoList, &zconfig.PhysicalIO{
++				Ptype:        evecommon.PhyIoType_PhyIoNetEth,
++				Phylabel:     iface.Name,
++				Logicallabel: iface.Name,
++				Assigngrp:    iface.AssignGrp,
++				Phyaddrs: map[string]string{
++					"Ifname":  iface.Name,
++					"PciLong": iface.PciLong,
++				},
++				Usage: evecommon.PhyIoMemberUsage_PhyIoUsageDedicated,
++			})
++		}
++	}
++
++	if hasPCIe && lmp != "" {
++		// Add LMP port as a managed PhysicalIO so NIM can build DevicePortConfig for it.
++		lmpNetUUID := uuid.NewV5(ns, *name+"/lmp-network").String()
++		deviceIoList = append(deviceIoList, &zconfig.PhysicalIO{
++			Ptype:        evecommon.PhyIoType_PhyIoNetEth,
++			Phylabel:     lmp,
++			Logicallabel: lmp,
++			Phyaddrs: map[string]string{
++				"Ifname": lmp,
++			},
++			Usage: evecommon.PhyIoMemberUsage_PhyIoUsageMgmtAndApps,
++		})
++		// DHCP network config for the LMP port.
++		networks = append(networks, &zconfig.NetworkConfig{
++			Id:   lmpNetUUID,
++			Type: evecommon.NetworkType_V4Only,
++			Ip:   &evecommon.Ipspec{Dhcp: evecommon.DHCPType_Client},
++		})
++		// Tell NIM to manage ONLY the LMP port; PCIe adapters are excluded.
++		systemAdapters = append(systemAdapters, &zconfig.SystemAdapter{
++			Name:           lmp,
++			Uplink:         true,
++			NetworkUUID:    lmpNetUUID,
++			LowerLayerName: lmp,
++			Cost:           0,
++		})
++		log.Printf("PCIe passthrough mode: NIM will manage only %s; PCIe adapters excluded from DevicePortConfig", lmp)
++	}
++
++	cfg := &zconfig.EdgeDevConfig{
++		ConfigItems:       configItems,
++		DeviceIoList:      deviceIoList,
++		Networks:          networks,
++		SystemAdapterList: systemAdapters,
++		Datastores: []*zconfig.DatastoreConfig{
++			{
++				Id:    dsUUID,
++				DType: zconfig.DsType_DsHttp,
++				Fqdn:  dsBase,
++				Dpath: "",
++			},
++		},
++		ContentInfo: []*zconfig.ContentTree{
++			{
++				Uuid:         ctUUID,
++				DsId:         dsUUID,
++				DsIdsList:    []string{dsUUID},
++				URL:          ctFile,
++				Iformat:      format,
++				MaxSizeBytes: uint64(sizeBytes),
++				DisplayName:  *name + "-disk",
++				Sha256:       *imageSHA256,
++			},
++		},
++		Volumes: []*zconfig.Volume{
++			{
++				Uuid: volUUID,
++				Origin: &zconfig.VolumeContentOrigin{
++					Type:                  zconfig.VolumeContentOriginType_VCOT_DOWNLOAD,
++					DownloadContentTreeID: ctUUID,
++				},
++				Maxsizebytes: sizeBytes,
++				DisplayName:  *name + "-vol",
++			},
++		},
++		NetworkInstances: networkInstances,
++		Apps: []*zconfig.AppInstanceConfig{
++			{
++				Uuidandversion: &zconfig.UUIDandVersion{Uuid: appUUID, Version: "1"},
++				Displayname:    *name,
++				Fixedresources: &zconfig.VmConfig{
++					Memory:             uint32(*memoryMB * 1024),
++					Maxmem:             uint32(*memoryMB * 1024),
++					Vcpus:              uint32(*cpus),
++					Maxcpus:            uint32(*cpus),
++					VirtualizationMode: zconfig.VmMode_HVM,
++					EnableVnc:          *enableVNC,
++					VncDisplay:         1,
++					VncPasswd:          *vncPasswd,
++				},
++				VolumeRefList: []*zconfig.VolumeRef{
++					{Uuid: volUUID, GenerationCount: 0, MountDir: ""},
++				},
++				Interfaces: appInterfaces,
++				Adapters:   pcieAdapters,
++				Activate:   true,
++			},
++		},
++	}
++
++	cfgBytes, err := proto.Marshal(cfg)
++	if err != nil {
++		log.Fatalf("proto.Marshal(EdgeDevConfig): %v", err)
++	}
++	sum := sha256.Sum256(cfgBytes)
++	configHash := hex.EncodeToString(sum[:8])
++
++	configResp := &zconfig.ConfigResponse{Config: cfg, ConfigHash: configHash}
++	b, err := proto.Marshal(configResp)
++	if err != nil {
++		log.Fatalf("proto.Marshal: %v", err)
++	}
++	if err := os.WriteFile(*output, b, 0644); err != nil {
++		log.Fatalf("write %s: %v", *output, err)
++	}
++
++	fmt.Printf("Written %d bytes to %s\n", len(b), *output)
++	fmt.Printf("\nSummary:\n")
++	fmt.Printf("  Config hash   : %s\n", configHash)
++	fmt.Printf("  VM name       : %s\n", *name)
++	fmt.Printf("  App UUID      : %s\n", appUUID)
++	fmt.Printf("  Volume UUID   : %s\n", volUUID)
++	if *uplink != "" {
++		fmt.Printf("  NAT NI        : %s via %s (%s)\n", natNIUUID, *uplink, *niSubnet)
++	}
++	if lmp != "" {
++		fmt.Printf("  LMP Switch NI : %s via %s\n", lmpNIUUID, lmp)
++	}
++	for i, iface := range profileInterfaces {
++		fmt.Printf("  Interface[%d]  : %s (%s)\n", i, iface.Name, iface.Type)
++	}
++	for _, a := range pcieAdapters {
++		fmt.Printf("  PCIe adapter  : %s\n", a.Name)
++	}
++	fmt.Printf("  VM interfaces : %d total\n", len(appInterfaces))
++	fmt.Printf("  Image URL     : %s\n", *imageURL)
++	fmt.Printf("  Memory        : %d MiB\n", *memoryMB)
++	fmt.Printf("  vCPUs         : %d\n", *cpus)
++	fmt.Printf("  VNC           : %v (display 1, port 5901, passwd: %v)\n", *enableVNC, *vncPasswd != "")
++	if *sshKey != "" {
++		fmt.Printf("  SSH key       : %s...\n", (*sshKey)[:40])
++	}
++}
++
++// splitImageURL splits a full image URL into the datastore base URL and filename.
++func splitImageURL(rawURL string) (base, file string) {
++	for _, scheme := range []string{"https://", "http://"} {
++		if !strings.HasPrefix(rawURL, scheme) {
++			continue
++		}
++		rest := rawURL[len(scheme):]
++		slash := strings.Index(rest, "/")
++		if slash < 0 {
++			return rawURL, ""
++		}
++		host := rest[:slash]
++		path := strings.TrimPrefix(rest[slash:], "/")
++		return scheme + host, path
++	}
++	return rawURL, ""
++}
++
++func parseFormat(s string) (zconfig.Format, error) {
++	switch strings.ToLower(s) {
++	case "raw":
++		return zconfig.Format_RAW, nil
++	case "qcow2":
++		return zconfig.Format_QCOW2, nil
++	case "qcow":
++		return zconfig.Format_QCOW, nil
++	case "vhd":
++		return zconfig.Format_VHD, nil
++	case "vmdk":
++		return zconfig.Format_VMDK, nil
++	case "iso":
++		return zconfig.Format_ISO, nil
++	default:
++		return zconfig.Format_FmtUnknown, fmt.Errorf("unknown format %q (supported: raw, qcow2, qcow, vhd, vmdk, iso)", s)
++	}
++}
+-- 
+2.51.0
+

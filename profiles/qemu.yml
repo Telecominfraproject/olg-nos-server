@@ -1,0 +1,106 @@
+# qemu.yml - Compile-time machine profile for QEMU testing
+# Used by gen-loc-config to generate conf/lps/loc-config.bin
+
+name: vyos
+
+image:
+  url: http://localhost:8888/images/small-vyos-ssh-nat.qcow2
+  sha256: 9c366e944206e5c04b5b8e67f297a2c1dce0a5d4d45a7773060230ab8c3a12fd
+  format: qcow2
+  size: 805175296  # bytes
+
+vm:
+  memory_mb: 1536
+  cpus: 3
+  vnc: true
+
+# LMP (Local Management Port): bridged to a Switch network instance.
+# VyOS gets a virtual NIC on this L2 bridge as its first interface (eth0).
+# In QEMU: eth1
+lmp: eth1
+
+# Management uplink: the EVE-side ethN that hosts EVE's own outbound
+# network (control plane / SSH-from-host / image fetch). In the QEMU
+# profile this is `eth0` (outer QEMU's first user-net, 192.168.1.0/24,
+# with hostfwd 2222→22 to EVE's sshd). Only consulted by gen-loc-config
+# when SystemAdapterList is explicit (i.e. PCIe-passthrough mode); in
+# the default no-passthrough flow NIM auto-discovers it via last-resort.
+mgmt_uplink: eth0
+
+# Additional interfaces passed to VyOS.
+# Interfaces are presented to VyOS in order: eth1, eth2, ...
+# (LMP is always first, so it lands as eth0 inside the guest.)
+#
+# PCIe passthrough requires the outer QEMU to have been launched with
+# matching e1000e devices behind their own pcie-root-ports — i.e.
+# `make run-live E1000E=1`. The PciLong + IOMMU group values come from
+# the EVE host's `lspci -D` and `/sys/kernel/iommu_groups/`.
+#
+# pt_e1k_wan is backed by an outer-QEMU slirp NAT (192.168.5.0/24),
+# giving VyOS its own internet egress independent of EVE's mgmt eth0.
+# vyos.wan points at it so the WAN role lands on a NIC that actually
+# reaches the host network.
+interfaces:
+  - name: pt_e1k0
+    type: pcie
+    pci: 0000:01:00.0
+    assigngrp: group9
+    mac: '52:54:00:e1:00:00'
+  - name: pt_e1k1
+    type: pcie
+    pci: 0000:02:00.0
+    assigngrp: group10
+    mac: '52:54:00:e1:00:01'
+  - name: pt_e1k_wan
+    type: pcie
+    pci: 0000:03:00.0
+    assigngrp: group11
+    mac: '52:54:00:e1:00:02'
+
+vnc_passwd: "eve"
+
+ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKFz5k4h6F0KEKmxygyHTfNY+eJuHr3KenhWkZALxmyM vm@eveos-dev"
+
+output: conf/lps/loc-config.bin
+
+vyos:
+  # ethN naming inside the VM (sequential PCIe assignment after the LMP VIF):
+  #   eth0 = LMP virtio VIF        → control plane (brcp), SSH + NATS bus
+  #   eth1 = pt_e1k0  (dummy slirp 192.168.3.0/24, no NAT egress)
+  #   eth2 = pt_e1k1  (dummy slirp 192.168.4.0/24, no NAT egress)
+  #   eth3 = pt_e1k_wan (slirp 192.168.5.0/24 with NAT to host — actual WAN)
+  wan: eth3
+  lmp_name: eth0
+
+  # Control-plane bridge (br0). LMP VIF only. EVE's udhcpc lands here
+  # and gets the static lease below; future NATS bus binds here.
+  # 192.168.33.0/24 keeps the inner cplane distinct from the EVE QEMU
+  # outer user-nets (192.168.1.0/24 mgmt, 192.168.5.0/24 VyOS WAN).
+  cplane:
+    subnet: 192.168.33.0/24
+    gateway: 192.168.33.1
+    dhcp_range_start: 192.168.33.100
+    dhcp_range_stop: 192.168.33.200
+    # Static lease for the EVE-side udhcpc client (DHCP option-61
+    # identifier "00:olg-eve" — see pkg/lps/lmp.go). Pinned so the
+    # NATS bind address is deterministic across boots.
+    eve_lmp_ip: 192.168.33.2
+
+  # Data-plane LAN bridge (br1). Members are PCIe-passthrough LAN
+  # ports for downstream clients. Empty in QEMU — no non-WAN PCIe LAN
+  # NICs here. On ms-01 this would hold the two 10G NICs.
+  lan: []
+  lan_subnet: 192.168.50.0/24
+  lan_gateway: 192.168.50.1
+  dhcp_range_start: 192.168.50.100
+  dhcp_range_stop: 192.168.50.200
+  hostname: vyos-qemu
+  name_servers:
+    - 8.8.8.8
+    - 8.8.4.4
+  ci_output: conf/lps/vyos-ci.iso
+  commands:
+    - set service ssh port 22
+    - set system login user admin authentication plaintext-password 'yourpassword'
+    - set system login user admin authentication public-keys host key 'AAAAC3NzaC1lZDI1NTE5AAAAIKFz5k4h6F0KEKmxygyHTfNY+eJuHr3KenhWkZALxmyM'
+    - set system login user admin authentication public-keys host type 'ssh-ed25519'

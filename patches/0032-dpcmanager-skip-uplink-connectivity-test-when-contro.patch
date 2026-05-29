@@ -1,0 +1,136 @@
+From b64f1dea7a9063edb882d3c55a8e0a7e69af9dca Mon Sep 17 00:00:00 2001
+From: Mateusz Bajorski <mbajorski@shasta.cloud>
+Date: Fri, 29 May 2026 13:19:56 +0000
+Subject: [PATCH] dpcmanager: skip uplink connectivity test when controller is
+ localhost
+
+In LPS-as-controller airgap mode (/config/server = localhost), DPC
+verification's uplink-based connectivity test is fundamentally
+mismatched -- the controller endpoint is served by pkg/lps on the
+EVE host itself and is reachable via loopback regardless of any
+physical NIC's carrier state. Without bypass, every cable-less boot
+gets stuck in:
+
+  DPC verify: no IP/DNS: will retry (waiting for X): All attempts to
+  connect to localhost/api/v2/edgedevice/ping failed: send via eth0:
+  link not up for interface eth0; send via eth1: ...; eth2: ...; eth3: ...
+
+and domainmgr loops on 'Waiting for AssignableAdapters, DPC with
+management ports and hypervisor capabilities' (39 occurrences in a
+2.5 minute boot log) -- so the bundled VyOS gateway never launches,
+which is precisely the host that the LMP path would normally use to
+bring uplink-style networking up. Catch-22.
+
+This patch short-circuits the connectivity test in verifyDPC when
+localControllerURL() returns true. The reconciler still runs (so
+bridges and ports get created), the deferred publishDPCL/DNS
+operations still fire, and the success path (recordDPCSuccess +
+DPCStateSuccess) is taken naturally because err is left nil.
+
+localControllerURL parses /config/server (using the existing
+types.ServerFileName constant), strips any :port suffix, and matches
+against localhost / 127.* / ::1. Any non-loopback host preserves
+upstream behavior unchanged.
+
+Signed-off-by: Mateusz Bajorski <mbajorski@shasta.cloud>
+---
+ pkg/pillar/dpcmanager/verify.go | 66 +++++++++++++++++++++++++++++++--
+ 1 file changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/pkg/pillar/dpcmanager/verify.go b/pkg/pillar/dpcmanager/verify.go
+index b495a4f46..3457b34af 100644
+--- a/pkg/pillar/dpcmanager/verify.go
++++ b/pkg/pillar/dpcmanager/verify.go
+@@ -7,9 +7,12 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"os"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/lf-edge/eve/pkg/pillar/conntester"
++	"github.com/lf-edge/eve/pkg/pillar/netdump"
+ 	"github.com/lf-edge/eve/pkg/pillar/netmonitor"
+ 	"github.com/lf-edge/eve/pkg/pillar/types"
+ )
+@@ -238,9 +241,29 @@ func (m *DpcManager) verifyDPC(ctx context.Context) (status types.DPCState) {
+ 
+ 	// Check controller connectivity.
+ 	m.updateDNS()
+-	withNetTrace := m.traceNextConnTest()
+-	intfStatusMap, tracedProbes, err := m.ConnTester.TestConnectivity(
+-		m.deviceNetStatus, m.getAirGapModeConf(), withNetTrace, types.NetTraceFolder)
++	var intfStatusMap types.IntfStatusMap
++	var tracedProbes []netdump.TracedNetRequest
++	var err error
++	withNetTrace := false
++	if m.localControllerURL() {
++		// OLG: in LPS-as-controller airgap setups (/config/server is
++		// localhost / 127.*), DPC verification doesn't depend on an
++		// uplink. The "controller" lives on the same kernel and is
++		// reachable via the loopback interface regardless of any
++		// physical NIC's carrier state. Without this short-circuit
++		// domainmgr stalls on "Waiting for AssignableAdapters, DPC
++		// with management ports and hypervisor capabilities" on
++		// every cable-less boot, and no apps (including the bundled
++		// VyOS gateway) ever launch -- so the very networking we'd
++		// need to come up to populate a DHCP lease on the LMP port
++		// never gets a chance to start.
++		m.Log.Noticef("DPC verify: /config/server points to localhost -- " +
++			"skipping uplink connectivity test (LPS-as-controller airgap mode)")
++	} else {
++		withNetTrace = m.traceNextConnTest()
++		intfStatusMap, tracedProbes, err = m.ConnTester.TestConnectivity(
++			m.deviceNetStatus, m.getAirGapModeConf(), withNetTrace, types.NetTraceFolder)
++	}
+ 	// Use TestResults to update the DevicePortConfigList and DeviceNetworkStatus
+ 	// Note that the TestResults will at least have an updated timestamp
+ 	// for one of the ports.
+@@ -633,6 +656,43 @@ func (m *DpcManager) getAirGapModeConf() conntester.AirGapMode {
+ 	}
+ }
+ 
++// localControllerURL reports whether /config/server names a host that
++// lives on the same kernel (localhost / 127.* / ::1). On olg-eve this
++// is the "LPS-as-controller" airgap mode -- the controller endpoint
++// is served by the pkg/lps package on the EVE host itself, reachable
++// over the loopback interface. In that mode DPC verification doesn't
++// need to test connectivity through an uplink port; LPS is reachable
++// regardless of any physical NIC's carrier state. See verifyDPC for
++// the actual short-circuit.
++//
++// Returns false if /config/server is unreadable or if the host looks
++// like a remote controller -- preserves upstream behavior for any
++// non-airgap deployment.
++func (m *DpcManager) localControllerURL() bool {
++	data, err := os.ReadFile(types.ServerFileName)
++	if err != nil {
++		return false
++	}
++	server := strings.TrimSpace(string(data))
++	if server == "" {
++		return false
++	}
++	// Strip optional :port suffix; keep IPv6 literals like [::1] intact.
++	host := server
++	if strings.HasPrefix(host, "[") {
++		if end := strings.IndexByte(host, ']'); end > 0 {
++			host = host[1:end]
++		}
++	} else if i := strings.IndexByte(host, ':'); i >= 0 {
++		host = host[:i]
++	}
++	switch host {
++	case "localhost", "127.0.0.1", "::1":
++		return true
++	}
++	return strings.HasPrefix(host, "127.")
++}
++
+ // If error returned from connectivity test was wrapped into PortsNotReady,
+ // unwrap it before recording it into DeviceNetworkStatus and DPCL.
+ // PortsNotReady error type is only useful between ConnectivityTester and DPC
+-- 
+2.51.0
+
