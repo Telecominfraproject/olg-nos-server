@@ -206,6 +206,128 @@ EVE's kernel serial output goes quiet once linuxkit finishes onboot and
 services attach to containerd. From that point onwards introspect via
 SSH / pubsub files rather than the serial log — see next section.
 
+## Flashing EVE to hardware
+
+Two build outputs matter for hardware deploys (e.g. `./build.sh ms-01`):
+
+| File | Path | Purpose |
+|---|---|---|
+| `installer.raw` | `eve/dist/amd64/snapshot/installer.raw` | Bootable USB image. dd to a stick, boot the target, installer lays down EFI + IMGA + IMGB + CONFIG + persist on the internal disk. |
+| `installer/rootfs.img` | `eve/dist/amd64/snapshot/installer/rootfs.img` | Raw squashfs for one A/B partition. dd directly to the inactive `IMGB` (or `IMGA`) partition over SSH to upgrade without USB — the SSH-based "Fix F" flow. Only works once the target has been installed with patch 0030 (IMGB ≥ 2 GB). |
+
+### First install — USB flash with dd
+
+1. **Identify the USB device.** Plug the stick in, watch `dmesg`:
+
+   ```sh
+   sudo dmesg --follow
+   # ... usb 1-2: new high-speed USB device number 7 using xhci_hcd
+   # ... sd 0:0:0:0: [sdX] Attached SCSI removable disk
+   ```
+
+   Or list block devices and pick the one whose size matches the stick (NOT
+   the host's internal NVMe/SSD):
+
+   ```sh
+   lsblk -o NAME,SIZE,MODEL,TRAN
+   ```
+
+2. **Unmount any auto-mounted partitions** (some desktops automount):
+
+   ```sh
+   for p in /dev/sdX*; do sudo umount "$p" 2>/dev/null; done
+   ```
+
+3. **Flash.** Replace `sdX` with the device from step 1 (no partition
+   number — write to the whole device). Don't typo this — `dd` will
+   happily overwrite the wrong disk:
+
+   ```sh
+   sudo dd if=eve/dist/amd64/snapshot/installer.raw \
+           of=/dev/sdX \
+           bs=4M status=progress conv=fsync
+   sync
+   ```
+
+   `bs=4M` chunks for throughput, `status=progress` shows pace,
+   `conv=fsync` forces a flush at end so the USB isn't ejected with
+   data still in cache.
+
+4. **Boot the target from the USB.** F12 / F2 / Del to enter the boot
+   menu varies per BIOS. On the MS-01, press **F7** during the splash
+   for one-shot boot menu, pick the USB stick.
+
+5. **Installer runs unattended** — it dd's the rootfs into IMGA, writes
+   IMGB as an empty 2 GB partition (per patch 0030), creates CONFIG +
+   persist, then reboots. The target is now installed; remove the USB.
+
+### What the installer lays down
+
+After install, the target's internal disk has:
+
+```
+nvme0n1p1  EFI System  36M    vfat
+nvme0n1p2  IMGA        2 GB   squashfs   ← currently active (rootfs.img copied here)
+nvme0n1p3  IMGB        2 GB   (empty placeholder for upgrades)
+nvme0n1p4  CONFIG      1M     vfat       (LPS profile, server URL, device UUID)
+nvme0n1p9  P3          rest   ext4       (/persist: logs, app volumes, vault)
+```
+
+Verify on a freshly-installed box via SSH:
+
+```sh
+ssh -i ~/.ssh/id_ed25519 root@<eve-ip>
+lsblk -o NAME,SIZE,PARTLABEL,FSTYPE
+/hostfs/usr/bin/zboot curpart                  # → IMGA after first install
+```
+
+### In-place upgrade over SSH (Fix F sketch — tooling pending)
+
+Once patch 0030 has laid down a 2 GB IMGB, future EVE upgrades skip the
+USB entirely:
+
+```sh
+# On the build host (you):
+scp eve/dist/amd64/snapshot/installer/rootfs.img \
+    root@<eve-ip>:/persist/rootfs-next.img
+
+# On the EVE target (SSH'd in):
+zboot=/hostfs/usr/bin/zboot
+$zboot curpart                                 # → IMGA  (so flash IMGB)
+INACTIVE=IMGB
+DEV=$(lsblk -nrpo NAME,PARTLABEL | awk -v p=$INACTIVE '$2==p{print $1}')
+dd if=/persist/rootfs-next.img of="$DEV" bs=4M status=progress conv=fsync
+sync
+
+# Mark the new partition for next boot and reboot:
+$zboot set_next_part $INACTIVE
+reboot
+```
+
+After reboot, `zboot curpart` will report `IMGB`. Roll back by running
+`zboot set_next_part IMGA && reboot` from the new image (the old image
+is untouched). **This flow is not yet scripted in the repo** — wrap it
+in `tools/ssh-upgrade.sh` once tested end-to-end.
+
+### Boot expectations on the ms-01 profile
+
+First boot after install, with **no cable connected to any NIC**, with
+the current patch series (Fix A + Fix G + Fix H + IMGB-2GB + profile
+swap):
+
+| Phase | Timing | Evidence |
+|---|---|---|
+| EVE kernel + linuxkit onboot | ~30-60s | grep serial / journal for `EVE is alive` |
+| **DPC verify bypass (Fix H)** | ~60-90s | `logread \| grep "skipping uplink connectivity test"` |
+| zedrouter creates LMP bridge `eth3` | shortly after | `ip link show eth3` |
+| **LPS attaches `lmp-keep-up` dummy (Fix G)** | shortly after | `logread \| grep "lmp-keep-up"` |
+| VyOS launches | ~90-150s | `eve app list` → vyos `RUNNING` |
+| VyOS' kea ready, EVE `bn1` gets `192.168.33.2` lease | ~3-7 min | `ip -4 addr show eth3` shows `192.168.33.2/24` |
+
+If VyOS reaches RUNNING but `192.168.33.1` is unreachable, you're likely
+hitting the gen-loc-config MAC-inversion bug (`[[reference_vyos_lmp_mac_inverted]]`
+in memory) — separate fix.
+
 ## Inspecting a running EVE / guest VMs
 
 SSH into EVE host:
