@@ -35,12 +35,12 @@ This document defines the technical specifications, structural design, input/out
 ### 2.2 `config/vyos_initial_state.json` (Declarative Cloud Desired State Envelope)
 * **Purpose**: Contains the declarative cloud-facing network configuration state envelope pushed into NATS JetStream KV store (`cfg_desired` bucket, key `desired.vyos`). Management connectivity (`eth3` at `192.168.254.1/24`) is strictly pre-baked into the local VyOS appliance image and is omitted from this envelope to prevent bootstrap deadlocks.
 * **Specification**:
-  * **Deterministic `hw-id` MAC Binding**: Binds logical WAN and LAN interfaces to exact physical MAC addresses to eliminate asynchronous kernel/USB enumeration reordering:
-    - `eth1`: Bound to physical `$WAN_MAC` (Physical PCI WAN NIC).
-    - `eth2`: Bound to physical `$LAN_MAC` (Physical LAN NIC or USB Dongle).
-  * Defines VyOS physical WAN interface `eth1` configured with `addressing: dynamic` to obtain the single Upstream DHCP Lease from the ISP for egress SNAT masquerade.
+  * **Declarative OpenWiFi Role-Based Port Mapping**: Uses OpenWiFi uCentral port selectors to bind physical interfaces dynamically to their logical roles:
+    - `WAN*`: Matches the passed-through physical WAN interface (`eth0`) and enslaves it into WAN routing bridge `br0`.
+    - `LAN2`: Matches the passed-through secondary physical LAN interface (`eth2`, PCI or USB) and enslaves it into LAN switch bridge `br1`.
+  * Defines VyOS WAN bridge `br0` (member `eth0`) configured with `addressing: dynamic` to obtain the single Upstream DHCP Lease from the ISP for egress SNAT masquerade.
   * Defines VyOS LAN bridge `br1` (member `eth2`, supporting Physical PCI LAN or USB LAN Dongle, IP `192.168.100.1/24`, DHCP range `192.168.100.10` to `192.168.100.200`).
-  * Defines SNAT outbound masquerade rule 100 on `eth1` for subnets `192.168.100.0/24` and `192.168.254.0/24`.
+  * Defines SNAT outbound masquerade rule 100 on `br0` for subnets `192.168.100.0/24` and `192.168.254.0/24`.
   * Defines mandatory `LAN_TO_MGMT` firewall policy:
     - **Source**: `192.168.100.0/24` (LAN subnet).
     - **Destination**: `192.168.254.0/24` (Management subnet).
@@ -97,12 +97,8 @@ This document defines the technical specifications, structural design, input/out
 * **Purpose**: Provides end-to-end zero-touch automated deployment and boot restoration in an entirely offline, self-contained execution model. Validates pre-installed host packages and pre-cached Docker images, deploys host Netplan bridges, binds VFIO PCI drivers, launches local Docker container microservices, seeds NATS JetStream KV state, and creates/boots the VyOS VM (systemd service units, binary tools, and container images are pre-installed during Golden OS image building to ensure zero internet dependencies prior to VyOS WAN routing).
 * **Input Arguments & CLI Options Contract (`startup_node.sh [OPTIONS]`)**:
   * `--image <PATH>` (Optional): Path to VyOS Golden Master QCOW2 image (Default: `/opt/olg/images/vyos-golden.qcow2`).
-  * `--host-mgmt-nic <NAME|BDF|MAC>` (Optional): Explicit physical host management/provisioning Ethernet interface selector (e.g. `eno1`, `0000:00:1f.6`, or MAC). Overrides auto-detection and adds the interface to `HOST_PROTECTED_INTERFACES` to prevent VFIO detachment.
-  * `--wan-pci <BDF>` (Optional): Explicit WAN PCI device BDF (e.g., `0000:03:00.0`). Overrides auto-discovery.
-  * `--usb-lan <TARGET>` (Optional): Explicit USB LAN dongle selector (accepts sysfs USB topology path e.g. `1-1.2`, MAC address e.g. `00:e0:4c:68:01:23`, serial number, or vendor:product ID `0b95:1790`). Overrides auto-discovery.
-  * `--lan-pci <BDF>` (Optional): Explicit secondary LAN PCI device BDF (e.g., `0000:04:00.0`). Overrides auto-discovery.
   * `--force-reseed` (Optional flag): Resets desired router configuration in NATS KV store to baseline envelope (`desired.vyos` in `cfg_desired`), overwriting any cloud-applied router configuration.
-  * `--recreate-vm` (Optional flag): Forces stopping the VM, verifying shutdown, resetting the ephemeral transient overlay disk, and restarting the `vyos-router` VM.
+  * `--recreate-vm` (Optional flag): Forces stopping the VM, verifying shutdown, resetting the ephemeral transient overlay disk, and restarting the `vyos-router` VM (safely deferred until all preflight, hardware profile, credential journal, and domain XML validations succeed).
   * `--skip-netplan` (Optional flag): Skips applying Netplan bridge configuration.
   * `--help`, `-h` (Optional flag): Displays CLI usage summary and available options.
 * **Execution Logic & Step Sequence**:
@@ -116,53 +112,55 @@ This document defines the technical specifications, structural design, input/out
        - **Atomic Versioned Upgrade Contract**: Upgrades MUST install a new versioned disk image (e.g. `/opt/olg/images/vyos-v1.4.0.qcow2` mode `0444`) and atomically switch the active reference only after cryptographic checksum verification succeeds.
      * **Strict Offline Invariant**: Runtime `apt-get install`, `apt-get update`, and remote `docker pull` commands are **strictly prohibited** during cold-boot orchestration.
      * **Failure Behavior**: If any required package, tool binary, container image digest, file permission check, or Golden QCOW2 disk checksum fails verification, the script logs the specific failure and **aborts immediately (`exit 1`)** before modifying network bridges or unbinding drivers for VFIO handoff. Golden OS images must remain complete, immutable, and cryptographically valid prior to appliance deployment.
-  2. **Authoritative Hardware Manifest & Interface Protection (`/etc/olg/hardware-manifest.json` / `/etc/olg/hardware.env`)**:
+  2. **Authoritative Hardware Profile & Interface Protection (`/etc/olg/hardware-profile.json`)**:
      * **IOMMU Kernel Preflight Verification**:
        - Verifies `/sys/kernel/iommu_groups` exists AND contains active subdirectories (`[ -d /sys/kernel/iommu_groups ] && find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d | grep -q .`). Aborts deployment safely if IOMMU is disabled in BIOS/UEFI or GRUB (`intel_iommu=on` / `amd_iommu=on iommu=pt`).
        - Verifies `dmesg` for active `DMAR` / `AMD-Vi` hardware virtualization enablement.
-     * **Authoritative Production Manifest vs Commissioning Discovery Contract**:
-       1. **Authoritative Production Factory Manifest (`/etc/olg/hardware-manifest.json` / `/etc/olg/hardware.env`)**:
-          - On production appliances, hardware identity is authoritative and pre-seeded with physical topology paths and permanent MAC addresses via `/etc/olg/hardware-manifest.json` (or `/etc/olg/hardware.env`):
-            ```json
-            {
-              "wan": { "pci_bdf": "0000:01:00.0", "pci_path": "/sys/devices/pci0000:00/0000:00:1c.4/0000:01:00.0", "mac": "52:54:00:12:34:56" },
-              "lan": { "type": "pci", "pci_bdf": "0000:02:00.0", "pci_path": "/sys/devices/pci0000:00/0000:00:1c.5/0000:02:00.0", "mac": "52:54:00:78:9a:bc" },
-              "host_protected_interfaces": [
-                { "name": "eno1", "pci_bdf": "0000:00:1f.6", "pci_path": "/sys/devices/pci0000:00/0000:00:1f.6", "mac": "52:54:00:de:f0:12", "role": "host-management" }
-              ]
-            }
-            ```
-          - **Host Management Interface Protection Invariant**: Any physical Ethernet interface listed in `host_protected_interfaces` is strictly retained by the Ubuntu host OS under its native Linux kernel driver. It is **PROHIBITED** from driver unbinding, VFIO override, and VM passthrough. All `host_protected_interfaces` MUST be verified active with native drivers and matching permanent MACs prior to any driver overrides.
-          - **Multi-NIC Topology & Identity Revalidation Contract**:
-            Relying solely on `vendor:device` IDs is strictly **PROHIBITED** because identical NIC models share identical PCI IDs and cannot distinguish renumbered BDFs. Before modifying drivers or launching the VM, `startup_node.sh` verifies:
-            1. Target device exists in sysfs (`/sys/bus/pci/devices/$BDF`) with PCI class `0x020000` (Class 0200 Ethernet controller).
-            2. Canonical physical sysfs device path (`readlink -f /sys/bus/pci/devices/$BDF`) strictly matches the persisted `pci_path` (physical PCIe bus hierarchy).
-            3. Target device does NOT match any entry in `host_protected_interfaces`.
-            4. If currently bound to a native host driver: Verifies that the permanent hardware MAC address (`/sys/bus/pci/devices/$BDF/net/*/address`) matches `WAN_MAC` (or `LAN_MAC`).
-            5. If already bound to `vfio-pci`: Cross-validates sysfs physical topology `pci_path`, and confirms all `host_protected_interfaces` are physically present with their expected native drivers and MACs.
-          - **Failure Behavior**: If a BDF exists but fails topology or MAC verification (e.g. after a BIOS PCIe bus renumbering or motherboard swap), `startup_node.sh` **aborts immediately (`exit 1`)** prior to unbinding any driver, preventing accidental detachment of host NICs or non-network PCIe devices.
-          - **Step 2a (Host Protected Interface Isolation Contract)**:
-            - **Explicit CLI Definition**: If `--host-mgmt-nic <NAME|BDF|MAC>` is supplied: Validates interface exists and designates it as `HOST_PROTECTED_INTERFACES` (strictly preventing VFIO unbinding and VM passthrough).
-            - **Active SSH Management Session Protection**: Inspects active inbound SSH sessions (e.g. `ss -tnp '( sport = :22 )'` / routing for `$SSH_CLIENT`). If the host is currently being managed over a physical interface, that interface is preserved in `HOST_PROTECTED_INTERFACES` to avoid severing active management.
-            - **Single Upstream DHCP Lease Invariant**: The host OS netplan strictly disables DHCP on all physical prospective WAN and LAN interfaces (`dhcp4: false`, `dhcp6: false`, `optional: true`). The Ubuntu host OS NEVER issues DHCP requests or acquires a DHCP lease on prospective WAN/LAN interfaces. Only the VyOS router VM (`eth1`) runs a DHCP client towards the upstream ISP modem, guaranteeing that exactly ONE DHCP client identifier and ONE external lease is ever requested or granted on the WAN.
-          - **Step 2b (PCI Ethernet WAN Candidate Selection)**: Scans PCI Ethernet controllers using `lspci -Dnn -d ::0200`, **strictly EXCLUDING `HOST_PROTECTED_INTERFACES`**.
-            - If `--wan-pci <BDF>` CLI flag is supplied: Validates `<BDF>` exists and is NOT in `HOST_PROTECTED_INTERFACES`.
-            - If CLI flag is omitted and **EXACTLY ONE** unassigned PCI candidate remains: Auto-selects it as `WAN_PCI_BDF` (even if currently holding the host default route) and records `WAN_MAC`.
-            - If **ZERO** or **MULTIPLE** candidate controllers exist without CLI flags: **Aborts deployment immediately (`exit 1`)** before modifying network bridges or VFIO state, requiring explicit `--wan-pci <BDF>` or `--host-mgmt-nic <NAME|BDF|MAC>` disambiguation.
-          - **Step 2c (LAN Interface Disambiguation & Discovery Contract)**:
-            - **USB Dongle Candidate Scan**: Inspects `lsusb` and `/sys/bus/usb/devices/` for supported USB Ethernet dongles (AX88179 `0b95:1790`, Realtek `0bda:8152/8153`).
-              - **If `--usb-lan <TARGET>` is supplied**: Matches `<TARGET>` against USB topology path (e.g. `1-1.2`), MAC address, serial number, or vendor:product ID. If multiple physical dongles match (such as two identical dongles matching a VID:PID), aborts immediately (`exit 1`) requiring an unambiguous topology path, MAC, or serial selector.
-              - **If `--usb-lan` is omitted and EXACTLY ONE supported USB dongle exists**: Auto-selects it, recording `LAN_TYPE=usb`, `LAN_USB_ID`, `LAN_USB_PORT_PATH` (sysfs topology path e.g. `1-1.2`), `LAN_USB_SERIAL` (if present), and `LAN_MAC`.
-              - **If MULTIPLE supported USB dongles exist without `--usb-lan`**: **Aborts deployment immediately (`exit 1`)** before modifying bridges or unbinding drivers, requiring explicit `--usb-lan <TARGET>` disambiguation.
-              - **If ZERO supported USB dongles exist**: Proceeds to Secondary PCI LAN discovery.
-            - **Secondary PCI LAN Discovery & Abort Contract**: When no USB dongle candidate is selected:
-              - Inspects remaining unassigned PCI Ethernet controllers, **strictly EXCLUDING `HOST_PROTECTED_INTERFACES` and `WAN_PCI_BDF`**.
-              - If `--lan-pci <BDF>` is provided: Validates that specified `<BDF>` exists and is NOT in `HOST_PROTECTED_INTERFACES` or `WAN_PCI_BDF`, setting `LAN_TYPE=pci`.
-              - If CLI flag is omitted and **EXACTLY ONE** secondary unassigned PCI candidate remains: Auto-selects it as `LAN_TYPE=pci`, `LAN_PCI_BDF`, and `LAN_MAC`.
-              - If **ZERO** or **MULTIPLE** secondary PCI candidates remain without CLI flags: **Aborts deployment immediately (`exit 1`)** before modifying network bridges or unbinding drivers, requiring explicit `--usb-lan <TARGET>` or `--lan-pci <BDF>` configuration.
-          - **Step 2d (Persistent Manifest Caching)**: Writes all resolved parameters and `HOST_PROTECTED_INTERFACES` to `/etc/olg/hardware-manifest.json` and `/etc/olg/hardware.env` for subsequent boots.
-       3. **Unconditional WAN Handoff Contract**: The selected WAN controller (`WAN_PCI_BDF`) is unconditionally transferred from the host Linux kernel to `vfio-pci` for VyOS ownership on boot. Any initial host default route on this NIC is relinquished to VyOS.
-       4. **Safe WAN Handoff Protocol**: Pre-configures host management bridge (`br-mgmt`), Docker stack, and NATS state BEFORE unbinding native host driver. It unbinds `<BDF>`, binds to `vfio-pci`, launches the VyOS VM, and exits cleanly (`exit 0`).
+     * **Authoritative Immutable Model Hardware Profile Contract**:
+       - Each appliance model ships with its own complete, immutable firmware image. All WAN, LAN, and host management interface identities are derived from an immutable model hardware profile baked into `/etc/olg/hardware-profile.json`.
+       - The orchestrator reads `/etc/olg/hardware-profile.json` on boot, resolves and validates physical ports against sysfs, and executes VFIO binding and VM passthrough without modifying or saving runtime state.
+       - **Pluggable Optical SFP/SFP+ Module Contract**:
+         - Interfaces terminating in SFP/SFP+ optical cages may have transceivers inserted, removed, or replaced at any time.
+         - Transceiver optics MUST NOT participate in persistent port identity.
+         - The orchestrator identifies NIC physical ports using stable platform information (PCI topology path / BDF / physical function), with MAC address and vendor/device IDs used as secondary verification.
+         - Absence, removal, or replacement of an optical transceiver module does not invalidate hardware identity or prevent appliance boot.
+       - **Format of `/etc/olg/hardware-profile.json`**:
+         ```json
+         {
+           "host_management": {
+             "pci_path": "/sys/devices/pci0000:00/0000:00:1f.6",
+             "pci_bdf": "0000:00:1f.6",
+             "mac": "52:54:00:de:f0:12"
+           },
+           "wan": {
+             "pci_path": "/sys/devices/pci0000:00/0000:00:1c.4/0000:01:00.0",
+             "pci_bdf": "0000:01:00.0",
+             "mac": "52:54:00:12:34:56"
+           },
+           "lan": {
+             "type": "pci",
+             "pci_path": "/sys/devices/pci0000:00/0000:00:1c.5/0000:02:00.0",
+             "pci_bdf": "0000:02:00.0",
+             "mac": "52:54:00:78:9a:bc"
+           },
+           "lan_ports": [
+             {
+               "pci_path": "/sys/devices/pci0000:00/0000:00:1c.5/0000:02:00.0",
+               "pci_bdf": "0000:02:00.0",
+               "mac": "52:54:00:78:9a:bc"
+             }
+           ]
+         }
+         ```
+       - **Host Management Interface Protection Invariant**: Any physical Ethernet interface listed under `host_management` is strictly retained by the Ubuntu host OS under its native Linux kernel driver. It is **PROHIBITED** from driver unbinding, VFIO override, and VM passthrough.
+       - **Multi-NIC Topology & Identity Revalidation Contract**:
+         Before modifying drivers or launching the VM, `startup_node.sh` validates:
+         1. Target PCI device exists in sysfs (`/sys/bus/pci/devices/$BDF`) with PCI class `0x0200*` (Ethernet controller).
+         2. Canonical physical sysfs device path (`readlink -f /sys/bus/pci/devices/$BDF`) matches the declared `pci_path`.
+         3. Target device does NOT match the protected `host_management` interface.
+       - **Failure Behavior**: If a declared interface fails topology verification, `startup_node.sh` **aborts immediately (`exit 1`)** prior to unbinding any driver.
+       - **Unconditional WAN Handoff Contract**: The selected WAN controller (`WAN_PCI_BDF`) is unconditionally transferred from the host Linux kernel to `vfio-pci` for VyOS ownership on boot. Any initial host default route on this NIC is relinquished to VyOS.
+       - **Safe WAN Handoff Protocol**: Pre-configures host management bridge (`br-mgmt`), Docker stack, and NATS state BEFORE unbinding native host driver. It unbinds `<BDF>`, binds to `vfio-pci`, launches the VyOS VM, and exits cleanly (`exit 0`).
      * **Strict Dedicated IOMMU Group Isolation Audit**: Prior to detaching any native host driver, verifies that `/sys/bus/pci/devices/$PCI_BDF/iommu_group` exists as a valid symlink for `WAN_PCI_BDF` (and `LAN_PCI_BDF` when `LAN_TYPE=pci`). Enforces that the number of PCI devices in the target IOMMU group MUST equal 1 (`[ $(ls /sys/bus/pci/devices/$PCI_BDF/iommu_group/devices | wc -l) -eq 1 ]`). If the group contains more than 1 PCI device or function (e.g. multi-port NIC sharing a group like `03:00.0` and `03:00.1`), deployment **ABORTS IMMEDIATELY** prior to driver unbind with error: `IOMMU Group Isolation Failure: $PCI_BDF IOMMU group contains N devices (must equal 1)`. Whole-group multi-device passthrough is not supported; strict 1:1 dedicated IOMMU group isolation is required.
   3. **Credential Transaction Journal Recovery & State Verification (`/etc/olg/credential-generation.json`)**:
      * **Crash-Consistency Audit**: To prevent booting from a split-brain or partially installed credential generation following an unclean host shutdown or sudden power loss, `startup_node.sh` audits the persistent transaction journal `/etc/olg/credential-generation.json`:
@@ -199,7 +197,7 @@ This document defines the technical specifications, structural design, input/out
           sync
           ```
        5. **Audit Logging**: Emits system log entry `CREDENTIAL_TRANSACTION_RECOVERY_TRIGGERED: Restored known-good credential generation $PREV_GEN following power interruption in state '$state'`.
-       - **Forensic Preservation State (`state == "ROLLBACK_FAILED"`)**: If the node boots with state `ROLLBACK_FAILED`, the orchestrator logs a critical warning `CREDENTIAL_TRANSACTION_RECOVERY_DEGRADED: Booting with prior failed rollback; preserving all *.prev snapshot files for forensic recovery`, avoids destructive unlinks, and allows the control plane to start with active files in degraded mode.
+       - **Forensic Preservation & Hard Abort State (`state == "ROLLBACK_FAILED"` or Corrupt/Unrecognized State)**: If the node boots with state `ROLLBACK_FAILED` (or if participant snapshot restoration fails during crash recovery, or if the journal is unreadable, corrupt JSON, or contains an unknown state), `startup_node.sh` logs a critical safety abort `CRITICAL SAFETY ABORT: Credential transaction journal is corrupt, unreadable, or in an unrecognized state`, preserves all existing `*.prev` snapshots and creates a timestamped corrupt journal backup (`${JOURNAL_FILE}.corrupt.$(date +%s)`), strictly avoids overwriting the journal or resetting to baseline `COMMITTED`, and **aborts execution immediately (`exit 1`)**. Automatic resets that could conceal partial credential installations or split-brain configurations are strictly prohibited without explicit, verified administrative recovery.
      * **Committed State Audit & Orphaned Rollback Cleanup (`state == "COMMITTED"`)**: 
        - Verifies file permissions (`0600 root:root` for active secret files).
        - Safely purges any stale/orphaned `*.prev` and `*.tmp` snapshot files left over from prior power cuts after commit (`rm -f /opt/olg/config/jwt/*.prev /opt/olg/config/*.prev /etc/olg/client/*.prev /etc/olg/guest-secrets/*.prev /opt/olg/config/jwt/*.tmp /etc/olg/client/*.tmp /etc/olg/guest-secrets/*.tmp`), preventing future rotations from accidentally restoring stale cross-generational artifacts.
@@ -255,7 +253,7 @@ This document defines the technical specifications, structural design, input/out
          Executes `./tools/nats_kv_pusher --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --payload ./config/vyos_initial_state.json --if-not-exists` over TLS. `nats_kv_pusher` inspects bucket `cfg_desired` and seeds the baseline envelope ONLY if `desired.vyos` is missing/empty, preserving any existing cloud-delivered configuration during normal boots and node recoveries.
   8. **Idempotent VFIO PCI Driver Binding (`driver_override` Contract)**:
      * **Already-Bound State Handling**: Inspects currently active driver via `readlink /sys/bus/pci/devices/$BDF/driver`. If a target device is already bound to `vfio-pci`, re-binding is skipped to prevent disrupting active device handles.
-     * **Native Driver Detection & Unbind**: If bound to a native host driver (e.g., `r8169`, `e1000e`, `igb`, `ixgbe`), persists the driver name to `/etc/olg/hardware.env` (`NATIVE_DRIVER`, `LAN_NATIVE_DRIVER`), detaches the interface from host bridges (`nomaster`), and executes unbind.
+     * **Native Driver Detection & Unbind**: If bound to a native host driver (e.g., `r8169`, `e1000e`, `igb`, `ixgbe`), detaches the interface from host bridges (`nomaster`) and executes unbind.
      * **Prohibits Global Vendor/Device ID Matching**: Global `/etc/modprobe.d/vfio.conf` with `options vfio-pci ids=vendor:device` is strictly **PROHIBITED** to prevent `vfio-pci` from claiming identical NIC models used by host management/SSH.
      * **Executes BDF-Specific Sysfs Driver Override**: Binds ONLY the targeted `$WAN_PCI_BDF` (and `$LAN_PCI_BDF` when `LAN_TYPE=pci`) to `vfio-pci` using sysfs BDF override:
        ```bash
@@ -320,9 +318,9 @@ This document defines the technical specifications, structural design, input/out
         </domain>
         ```
       * Attaches WAN PCI controller via VFIO (`<hostdev type='pci'>` for `WAN_PCI_BDF`).
-      * Attaches LAN interface according to `/etc/olg/hardware.env`:
+      * Attaches LAN interface according to `/etc/olg/hardware-profile.json`:
         - If `LAN_TYPE=pci`: Attaches `<hostdev type='pci'>` for `LAN_PCI_BDF`.
-        - If `LAN_TYPE=usb`: Resolves active USB bus/device numbers from sysfs (`BUS=$(cat /sys/bus/usb/devices/$LAN_USB_PORT_PATH/busnum)`, `DEV=$(cat /sys/bus/usb/devices/$LAN_USB_PORT_PATH/devnum)`). Validates MAC matching `LAN_MAC` and attaches `<hostdev mode='subsystem' type='usb'><source><address bus='$BUS' device='$DEV'/></source></hostdev>` to guarantee exact physical USB device targeting even when identical USB dongles exist.
+        - If `LAN_TYPE=usb`: Resolves active USB bus/device numbers from sysfs (`LAN_USB_BUS`, `LAN_USB_DEV`) and attaches `<hostdev mode='subsystem' type='usb'><source><address bus='$LAN_USB_BUS' device='$LAN_USB_DEV'/></source></hostdev>` to guarantee exact physical USB device targeting even when identical USB dongles exist.
       * **Idempotent VM Lifecycle & Strict State Transition Contract**:
         ```bash
         VM_STATE=$(virsh domstate vyos-router 2>/dev/null || echo "shut off")
@@ -371,7 +369,11 @@ This document defines the technical specifications, structural design, input/out
             ;;
         esac
         ```
-  10. **Single VM Startup Owner Contract & Clean Service Exit**: Explicitly disables libvirt domain autostart (`virsh autostart --disable vyos-router`) to ensure `startup_node.sh` remains the sole boot-time orchestrator before handing off crash recovery to Libvirt. Exits cleanly with status code `0`.
+  10. **Post-Boot VyOS Management Gateway Verification (Zero-SSH Declarative Model)**:
+      * Following domain launch, `startup_node.sh` performs a non-invasive network health probe verifying reachability of the VyOS management gateway interface (`192.168.254.1`) on `br-mgmt`.
+      * **Zero-SSH Invariant**: The host orchestrator does NOT require SSH credentials, keys, or interactive remote commands (`sshpass` and host-side SSH execution are prohibited). All in-guest configuration is managed declaratively by `vyos-nats-agent` subscribing to NATS JetStream `cfg_desired`.
+      * **Kea DHCP Bridge Interface Binding (`listen-interface br1`)**: To ensure the Kea DHCP server on VyOS responds reliably on LAN bridges without dropping requests on unnumbered slave ports (such as USB Ethernet `eth2`), the binding `set service dhcp-server listen-interface br1` is baked directly into the base golden master image (`/opt/olg/images/vyos-golden.qcow2`) via `/config/scripts/vyos-postconfig-bootup.script` and the baseline desired configuration.
+  11. **Single VM Startup Owner Contract & Clean Service Exit**: Explicitly disables libvirt domain autostart (`virsh autostart --disable vyos-router`) to ensure `startup_node.sh` remains the sole boot-time orchestrator before handing off crash recovery to Libvirt. Exits cleanly with status code `0`.
 
 ---
 
@@ -482,8 +484,8 @@ This document defines the technical specifications, structural design, input/out
 4. **Renderer Immutable Invariants & Validation Contract**:
    - **Immutable Invariants**: The configuration rendering agent strictly enforces the following immutable baseline invariants:
      - Core management interface IP address and link (`eth3` at `192.168.254.1/24`, MAC `52:54:00:f9:ab:48`), which is initialized exclusively from the local pre-baked VyOS bootstrap image (`/config/config.boot`) and is **never** dependent on or overridden by `desired.vyos`.
-     - Physical WAN interface identity and dynamic DHCP configuration (`eth1` bound to discovered `$WAN_MAC`).
-     - Outbound SNAT masquerade rule 100 on `eth1`.
+     - Physical WAN bridge identity and dynamic DHCP configuration (`br0` containing physical WAN `eth0`).
+     - Outbound SNAT masquerade rule 100 on `br0`.
      - `LAN_TO_MGMT` firewall policy dropping inter-zone traffic (`192.168.100.0/24` -> `192.168.254.0/24`).
    - **Cloud Payload Validation & Rejection Contract**:
      - The rendering agent validates desired configuration states (`desired.vyos` from `cfg_desired`) prior to applying or committing changes.

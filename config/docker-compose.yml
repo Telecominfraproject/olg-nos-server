@@ -1,0 +1,43 @@
+services:
+  nats-server:
+    image: nats:2.10-alpine
+    pull_policy: never
+    container_name: nats-server
+    restart: unless-stopped
+    ports:
+      - "192.168.254.2:4222:4222"
+      - "127.0.0.1:4222:4222"
+    volumes:
+      - /opt/olg/data/nats:/data/jetstream
+      - /opt/olg/config/nats.conf:/etc/nats/nats.conf:ro
+      - /opt/olg/config/resolver.conf:/etc/nats/resolver.conf:ro
+      - /opt/olg/config/certs/nats-server.crt:/etc/nats/certs/nats-server.crt:ro
+      - /opt/olg/config/certs/nats-server.key:/etc/nats/certs/nats-server.key:ro
+      - /opt/olg/config/certs/ca.crt:/etc/nats/certs/ca.crt:ro
+      - /opt/olg/config/jwt/operator.jwt:/etc/nats/jwt/operator.jwt:ro
+    command: ["nats-server", "-c", "/etc/nats/nats.conf"]
+    networks:
+      - olg-bridge
+
+  ucentral-client:
+    image: ucentral-client:latest
+    pull_policy: never
+    container_name: ucentral-client
+    restart: unless-stopped
+    volumes:
+      - /etc/olg/client:/etc/olg/client:ro
+      - /etc/ucentral:/etc/ucentral:ro
+    environment:
+      - OW_INTERFACE_MAP_FILE=/etc/ucentral/interface_map.json
+      - OW_CAPABILITIES_FILE=/etc/ucentral/capabilities.json
+      - OLG_TRACE_UPLOAD_ALLOWED_URL=https://openwifi3.routerarchitects.com:16003
+    command: ["-config", "/etc/olg/client/config.json"]
+    networks:
+      - olg-bridge
+    depends_on:
+      - nats-server
+
+networks:
+  olg-bridge:
+    name: olg-bridge
+    driver: bridge
