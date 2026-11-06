@@ -1,0 +1,121 @@
+# ==============================================================================
+# OpenLAN Gateway (OLG) Enterprise Appliance Manifest
+# Single declarative specification for VyOS, Host, Binaries, Patches & Cloud
+# ==============================================================================
+
+version: "1.0"
+
+# ------------------------------------------------------------------------------
+# VyOS Router VM Components
+# Each binary is built (with optional patches) and injected into vyos-golden.qcow2
+# ------------------------------------------------------------------------------
+vyos:
+  base_image:
+    cache_name: "vyos-base.qcow2"
+    url: "" # Optional fallback URL if vyos-base.qcow2 is missing from build/cache/
+    sha256: "" # Optional expected SHA-256 checksum for source image verification
+
+  binaries:
+    - name: vyos-nats-agent
+      type: go
+      repo: "https://github.com/RouterArchitects/TIP-olg-server-vyos-client-natsagent.git"
+      ref: "feat/rtty" # Branch, tag, or pinned Git commit SHA
+      local_path: "../TIP-olg-server-vyos-client-natsagent"
+      dest: "/usr/local/bin/vyos-nats-agent"
+      build_cmd: "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags='-w -s' -o {output} ./cmd/..."
+
+    - name: rtty
+      type: cmake
+      url: "https://github.com/zhaojh329/rtty/releases/download/v7.1.4/rtty-7.1.4.tar.gz"
+      dest: "/usr/sbin/rtty"
+      build_container: "debian:bookworm-slim"
+      cmake_args: "-DRTTY_USE_OPENSSL=ON"
+      libraries:
+        - "/usr/lib/x86_64-linux-gnu/libev.so.4*"
+      patches:
+        repo: "https://github.com/routerarchitects/ra_wlan-ap.git"
+        ref: "Router-Architects_Main"
+        path: "feeds/ucentral/rtty/patches"
+        local_dir: "../ra_wlan-ap/feeds/ucentral/rtty/patches"
+
+# ------------------------------------------------------------------------------
+# Host Ubuntu OS Components
+# Binaries, containers and packages packaged into the air-gapped Ubuntu installer ISO
+# ------------------------------------------------------------------------------
+host:
+  ubuntu_release: "25.10"
+  ubuntu_iso_url: "https://releases.ubuntu.com/25.10/ubuntu-25.10-live-server-amd64.iso"
+  ubuntu_iso_sha256: "" # Optional expected SHA-256 checksum for base Ubuntu installer ISO
+  hardware_profile: "config/hardware-profiles/acer-aspire-gateway.json"
+
+  binaries:
+    - name: nats_pki_bootstrap
+      type: go
+      local_path: "tools/nats_pki_bootstrap.go"
+      dest: "tools/nats_pki_bootstrap"
+      build_cmd: "CGO_ENABLED=0 go build -ldflags='-w -s' -o {output} nats_pki_bootstrap.go"
+
+    - name: nats_kv_pusher
+      type: go
+      local_path: "tools/nats_kv_pusher.go"
+      dest: "tools/nats_kv_pusher"
+      build_cmd: "CGO_ENABLED=0 go build -ldflags='-w -s' -o {output} nats_kv_pusher.go"
+
+  containers:
+    - name: ucentral-client
+      type: docker-build
+      repo: "https://github.com/RouterArchitects/TIP-olg-ucentral-client.git"
+      ref: "RA-dev-main" # Branch, tag, or pinned Git commit SHA
+      # local_path: "../TIP-olg-ucentral-client"
+      tag: "ucentral-client:latest"
+      cache_tar: "docker-cache/ucentral-client.tar"
+
+    - name: nats-server
+      type: docker-pull
+      # Pinned image tag or immutable digest (e.g., nats@sha256:...)
+      image: "nats:2.10-alpine"
+      cache_tar: "docker-cache/nats-server.tar"
+
+  # ------------------------------------------------------------------------------
+  # Host Custom Files & Configurations (Optional)
+  # Generic mechanism to inject arbitrary custom files, configurations, capabilities,
+  # or scripts onto the appliance host filesystem (supports local_path or url).
+  # NOTE: This section is strictly optional. If any file is declared, it must exist
+  # at the specified path (otherwise build.sh aborts to prevent incomplete builds).
+  # ------------------------------------------------------------------------------
+  files: []
+  # Example: Uncomment to inject optional custom capabilities or mTLS certificates:
+  # files:
+  #   - name: "capabilities"
+  #     local_path: "config/capabilities.json"
+  #     dest: "/etc/ucentral/capabilities.json"
+  #     mode: "0644"
+  #   - name: "device-ca-cert"
+  #     local_path: "certs/ca.pem"
+  #     dest: "/etc/olg/device-certs/ca.pem"
+  #     mode: "0644"
+  #   - name: "device-client-cert"
+  #     local_path: "certs/cert.pem"
+  #     dest: "/etc/olg/device-certs/cert.pem"
+  #     mode: "0644"
+  #   - name: "device-client-key"
+  #     local_path: "certs/key.pem"
+  #     dest: "/etc/olg/device-certs/key.pem"
+  #     mode: "0600"
+
+  offline_packages:
+    - qemu-system-x86
+    - libvirt-daemon-system
+    - libvirt-clients
+    - virtiofsd
+    - docker.io
+    - docker-compose-v2
+    - containerd
+    - runc
+    - jq
+    - openssl
+    - pciutils
+    - iproute2
+    - curl
+    - ca-certificates
+    - netplan.io

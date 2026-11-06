@@ -17,7 +17,7 @@ This document defines the technical specifications, structural design, input/out
 ### 2.1 `config/netplan_bridges.yaml` (Netplan Host Bridge Template)
 * **Purpose**: Defines system-level NetworkManager / `systemd-networkd` bridge configuration for persistent host management bridge.
 * **Specification**:
-  * `br-mgmt`: Configured as a persistent Linux bridge assigned static IP `192.168.254.2/24` with default gateway `192.168.254.1` (pointing to VyOS management gateway `eth3`).
+  * `br-mgmt`: Configured as a persistent Linux bridge assigned static IP `192.168.254.2/24` with default gateway `192.168.254.1` (pointing to VyOS management gateway `mgmt0`).
   * **Netplan Template**:
     ```yaml
     network:
@@ -33,7 +33,7 @@ This document defines the technical specifications, structural design, input/out
     ```
 
 ### 2.2 `config/vyos_initial_state.json` (Declarative Cloud Desired State Envelope)
-* **Purpose**: Contains the declarative cloud-facing network configuration state envelope pushed into NATS JetStream KV store (`cfg_desired` bucket, key `desired.vyos`). Management connectivity (`eth3` at `192.168.254.1/24`) is strictly pre-baked into the local VyOS appliance image and is omitted from this envelope to prevent bootstrap deadlocks.
+* **Purpose**: Contains the declarative cloud-facing network configuration state envelope pushed into NATS JetStream KV store (`cfg_desired` bucket, key `desired.vyos`). Management connectivity (`mgmt0` at `192.168.254.1/24`) is strictly pre-baked into the local VyOS appliance image and is omitted from this envelope to prevent bootstrap deadlocks.
 * **Specification**:
   * **Declarative OpenWiFi Role-Based Port Mapping**: Uses OpenWiFi uCentral port selectors to bind physical interfaces dynamically to their logical roles:
     - `WAN*`: Matches the passed-through physical WAN interface (`eth0`) and enslaves it into WAN routing bridge `br0`.
@@ -483,13 +483,13 @@ This document defines the technical specifications, structural design, input/out
 3. **Passive Telemetry Monitoring**: Egress ICMP metrics are continuously observed via `dpinger` and `telemetry_dashboard.sh` for link health reporting. Packet loss is strictly an external metric and does not trigger VM lifecycle events.
 4. **Renderer Immutable Invariants & Validation Contract**:
    - **Immutable Invariants**: The configuration rendering agent strictly enforces the following immutable baseline invariants:
-     - Core management interface IP address and link (`eth3` at `192.168.254.1/24`, MAC `52:54:00:f9:ab:48`), which is initialized exclusively from the local pre-baked VyOS bootstrap image (`/config/config.boot`) and is **never** dependent on or overridden by `desired.vyos`.
+     - Core management interface IP address and link (`mgmt0` at `192.168.254.1/24`, MAC `52:54:00:f9:ab:48`), which is initialized exclusively by the internal management layer and is **never** dependent on or overridden by `desired.vyos`.
      - Physical WAN bridge identity and dynamic DHCP configuration (`br0` containing physical WAN `eth0`).
      - Outbound SNAT masquerade rule 100 on `br0`.
      - `LAN_TO_MGMT` firewall policy dropping inter-zone traffic (`192.168.100.0/24` -> `192.168.254.0/24`).
    - **Cloud Payload Validation & Rejection Contract**:
      - The rendering agent validates desired configuration states (`desired.vyos` from `cfg_desired`) prior to applying or committing changes.
-     - If an incoming cloud desired configuration attempts to modify, overwrite, or remove any immutable invariant (e.g. altering `eth3`, disabling SNAT Rule 100, or dropping `LAN_TO_MGMT` firewall):
+     - If an incoming cloud desired configuration attempts to modify, overwrite, or remove any immutable invariant (e.g. altering `mgmt0`, disabling SNAT Rule 100, or dropping `LAN_TO_MGMT` firewall):
        - The renderer **rejects** the conflicting configuration payload.
        - The currently active, valid configuration is **preserved** without disruption.
        - A validation failure status event is published to `status.>` and `result.>` to alert the cloud control plane.
@@ -540,7 +540,7 @@ This document defines the technical specifications, structural design, input/out
        - `_INBOX.>` (Receive JetStream API responses)
      - **Prohibitions**: Cannot delete streams/buckets, modify orchestrator settings, or publish false router status events.
   3. **`vyos_agent` (`/etc/olg/guest-secrets/vyos_agent.creds`)**:
-     - **Role**: Router configuration agent inside VyOS VM connecting over management link `eth3` (`192.168.254.1` $\rightarrow$ `192.168.254.2:4222`).
+     - **Role**: Router configuration agent inside VyOS VM connecting over management link `mgmt0` (`192.168.254.1` $\rightarrow$ `192.168.254.2:4222`).
      - **Publish Permissions**:
        - `status.>`, `health.>`, `result.>` (Publish applied router status and health telemetry)
        - `$JS.API.STREAM.INFO.KV_cfg_desired` (Discover bucket info)
@@ -608,7 +608,7 @@ This document defines the technical specifications, structural design, input/out
 
 ### 7.5 Host-to-Guest Per-Device Credential Provisioning & Dynamic Zero-VM-Reboot Rotation Contract (`virtiofs` & Directory Mounts)
 * **Secretless Golden Image Architectural Separation**:
-  - **Golden Image (`/opt/olg/images/vyos-golden.qcow2`)**: 100% generic, immutable, and secretless across all appliance deployments. Contains system binaries, `vyos-nats-agent`, config renderer, `qemu-guest-agent` (pre-enabled via `systemctl enable qemu-guest-agent.service`), bootstrap management interface configuration (`eth3` at `192.168.254.1/24`), and systemd units.
+  - **Golden Image (`/opt/olg/images/vyos-golden.qcow2`)**: 100% generic, immutable, and secretless across all appliance deployments. Contains system binaries, `vyos-nats-agent`, config renderer, `qemu-guest-agent` (pre-enabled via `systemctl enable qemu-guest-agent.service`), bootstrap management interface configuration (`mgmt0` at `192.168.254.1/24`), and systemd units.
   - **Persistent Host State**: Per-device identities, local appliance TLS certificates, and NATS JWT/NKey credentials (`/opt/olg/config/jwt/`, `/opt/olg/config/certs/`, `/etc/olg/client/config.json`, `/etc/olg/client/ucentral.creds`, `/etc/olg/client/ca.crt`, `/etc/olg/guest-secrets/vyos_agent.creds`, `/etc/olg/guest-secrets/agent.env`, `/etc/olg/guest-secrets/ca.crt`) generated during host provisioning and secured with strict host permissions (directories `0700 root:root`, secret files/keys `0600 root:root`, public certs `0644 root:root`).
 * **Directory-Level Bind Mount Contract (Inode & Staging Safety)**:
   - **`nats-server`**: Host directory `/opt/olg/config` is bind-mounted to container directory `/etc/nats:ro`. Directory-level mounting prevents Linux kernel single-file inode pinning during `mv` replacement and ensures staged candidate files (`/opt/olg/config/jwt/*.tmp`, `/opt/olg/config/nats.conf.tmp`) are immediately visible inside `/etc/nats/` for validation.
@@ -789,5 +789,5 @@ This document defines the technical specifications, structural design, input/out
 * **In-Memory Running Configuration Enforcement**:
   - The configuration renderer MUST commit cloud-managed configuration changes received from NATS JetStream to the active running VyOS configuration (`commit`).
   - The renderer MUST NOT save cloud-managed configuration to the guest boot configuration file (`/config/config.boot`).
-* **Stateless Clean Boot Guarantee**: On every cold boot or hypervisor recovery, VyOS boots cleanly from its immutable baseline state, initializes the management network (`eth3`), and fetches the authoritative desired state fresh from persistent NATS JetStream KV storage (`desired.vyos`), preventing state drift and configuration pollution on the transient disk.
+* **Stateless Clean Boot Guarantee**: On every cold boot or hypervisor recovery, VyOS boots cleanly from its immutable baseline state, initializes the management network (`mgmt0`), and fetches the authoritative desired state fresh from persistent NATS JetStream KV storage (`desired.vyos`), preventing state drift and configuration pollution on the transient disk.
 

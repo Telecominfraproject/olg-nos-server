@@ -1,0 +1,20 @@
+# Images and Checksums
+*.qcow2
+*.sha256
+*.iso
+*.tar
+
+# Build Artifacts & Cache
+build/output/
+build/cache/
+build/iso/cache/
+build/.tmp/
+build/tmp/
+build.yaml
+!build.yaml.example
+
+# Local Certificates and Secrets
+certs/
+*.pem
+*.key
+*.crt

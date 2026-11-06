@@ -1,0 +1,38 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  refresh-installer:
+    update: false
+
+  # Headless serial console + VGA output
+  kernel:
+    package: linux-generic
+
+  # Storage configuration: Auto-selects primary NVMe/SSD, creates resilient partition layout
+  storage:
+    layout:
+      name: direct
+    swap:
+      size: 0
+
+  # Enterprise system identity (Secretless baseline; unique keys minted on first boot)
+  identity:
+    hostname: olg-appliance
+    username: olg
+    # Default password: olgadmin (SHA-512 crypt)
+    password: "$6$olgadmin$tRe0/X8PftA6fg9IV2/wzAwlUszSHIdUFAbvMK6PZrK4ou6hqG/3oZHWvf8ysscbrk1vITOizLRnGO7DbxeHa1"
+
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  # Post-install enterprise configuration
+  late-commands:
+    # 1. Delegate all post-install commands to self-contained finish_install.sh script
+    - /cdrom/olg-payload/finish_install.sh
+  # Automatically reboot after installation completes so it boots directly into the new appliance
+  reboot: true
+

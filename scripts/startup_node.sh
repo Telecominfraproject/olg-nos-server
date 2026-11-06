@@ -43,6 +43,7 @@ TOOLS_DIR="$OPT_OLG_DIR/tools"
 ETC_OLG_DIR="/etc/olg"
 CLIENT_DIR="$ETC_OLG_DIR/client"
 GUEST_SECRETS_DIR="$ETC_OLG_DIR/guest-secrets"
+DEVICE_CERTS_DIR="$ETC_OLG_DIR/device-certs"
 JOURNAL_FILE="$ETC_OLG_DIR/credential-generation.json"
 HARDWARE_PROFILE="$ETC_OLG_DIR/hardware-profile.json"
 
@@ -106,6 +107,25 @@ log_info "================================================================="
 # ------------------------------------------------------------------------------
 log_info "Phase 1: Validating system dependencies and golden master image..."
 
+# Self-heal offline deb packages if missing on first boot
+if ! command -v docker >/dev/null 2>&1 || ! command -v virsh >/dev/null 2>&1 || ! systemctl is-active --quiet libvirtd; then
+  if [ -f "$OPT_OLG_DIR/debs/Packages.gz" ]; then
+    log_info "Pre-installing offline system packages from local repository in $OPT_OLG_DIR/debs..."
+    echo "deb [trusted=yes] file:$OPT_OLG_DIR/debs ./" > /etc/apt/sources.list.d/olg-offline.list
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      docker.io docker-compose-v2 containerd runc qemu-system-x86 libvirt-daemon-system libvirt-clients virtiofsd jq
+    rm -f /etc/apt/sources.list.d/olg-offline.list
+  elif ls "$OPT_OLG_DIR/debs"/*.deb >/dev/null 2>&1 && (! command -v docker >/dev/null 2>&1 || ! command -v virsh >/dev/null 2>&1); then
+    log_info "Pre-installing offline system packages from $OPT_OLG_DIR/debs..."
+    DEBIAN_FRONTEND=noninteractive dpkg --unpack --skip-same-version "$OPT_OLG_DIR/debs"/*.deb
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+  fi
+  dpkg --audit
+  systemctl daemon-reload
+  systemctl enable --now docker.service libvirtd.service libvirtd.socket
+fi
+
 for tool in qemu-system-x86_64 virsh virt-xml-validate docker jq openssl ip lspci ping modprobe sha256sum netplan; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     log_error "Missing required system tool: $tool"
@@ -140,6 +160,17 @@ if ! (cd "$(dirname "$GOLDEN_IMAGE_PATH")" && sha256sum -c "$CHECKSUM_FILE" >/de
 fi
 log_info "Golden master image integrity verified [OK]."
 
+# Auto-load pre-cached offline Docker container images if present
+if [ -d "$OPT_OLG_DIR/docker-cache" ]; then
+  log_info "Loading pre-cached offline Docker container images..."
+  for img_tar in "$OPT_OLG_DIR/docker-cache"/*.tar; do
+    if [ -f "$img_tar" ]; then
+      log_info "Loading container image archive: $(basename "$img_tar")"
+      docker load -i "$img_tar" || log_warn "Failed to load $img_tar"
+    fi
+  done
+fi
+
 REQUIRED_IMAGES=("nats:2.10-alpine" "ucentral-client:latest")
 for img in "${REQUIRED_IMAGES[@]}"; do
   if ! docker image inspect "$img" >/dev/null 2>&1; then
@@ -154,7 +185,7 @@ done
 # ------------------------------------------------------------------------------
 log_info "Phase 2: Executing hardware discovery and PCI allocation policy..."
 
-mkdir -p "$ETC_OLG_DIR" "$OPT_OLG_DIR" "$CONFIG_DIR" "$CERTS_DIR" "$JWT_DIR" "$DATA_DIR" "$CLIENT_DIR" "$GUEST_SECRETS_DIR"
+mkdir -p "$ETC_OLG_DIR" "$OPT_OLG_DIR" "$CONFIG_DIR" "$CERTS_DIR" "$JWT_DIR" "$DATA_DIR" "$CLIENT_DIR" "$GUEST_SECRETS_DIR" "$DEVICE_CERTS_DIR"
 
 # Discover all PCI Ethernet Controllers (Class 0200)
 PCI_ETH_LIST=($(lspci -Dnn -d ::0200 | awk '{print $1}'))
@@ -771,15 +802,33 @@ fi
 cp -f "$CERTS_DIR/ca.crt" "$CLIENT_DIR/ca.crt" 2>/dev/null || true
 cp -f "$CERTS_DIR/ca.crt" "$GUEST_SECRETS_DIR/ca.crt" 2>/dev/null || true
 
-[ -f "$BASE_DIR/config/nats.conf" ] && cp -f "$BASE_DIR/config/nats.conf" "$CONFIG_DIR/nats.conf"
-[ -f "$BASE_DIR/config/docker-compose.yml" ] && cp -f "$BASE_DIR/config/docker-compose.yml" "$OPT_OLG_DIR/docker-compose.yml"
+[ -f "$BASE_DIR/config/nats.conf" ] && [ "$BASE_DIR/config" != "$CONFIG_DIR" ] && cp -f "$BASE_DIR/config/nats.conf" "$CONFIG_DIR/nats.conf"
+[ -f "$BASE_DIR/config/docker-compose.yml" ] && [ "$BASE_DIR/config/docker-compose.yml" != "$OPT_OLG_DIR/docker-compose.yml" ] && cp -f "$BASE_DIR/config/docker-compose.yml" "$OPT_OLG_DIR/docker-compose.yml"
 
 # Sync cloud TLS certs if provisioned in client repository or custom path
 if [ -d "$BASE_DIR/../TIP-olg-ucentral-client/certs" ]; then
-  cp -f "$BASE_DIR/../TIP-olg-ucentral-client/certs"/* "$CLIENT_DIR/" 2>/dev/null || true
+  cp -f "$BASE_DIR/../TIP-olg-ucentral-client/certs"/* "$DEVICE_CERTS_DIR/" 2>/dev/null || true
 fi
 
-# Enforce secure directory permissions (0700 root:root)
+# Migration/backward compatibility: If certs were placed in client/ or guest-secrets/, sync to device-certs/
+if [ ! -f "$DEVICE_CERTS_DIR/cert.pem" ] && [ -f "$CLIENT_DIR/cert.pem" ]; then
+  cp -f "$CLIENT_DIR/cert.pem" "$DEVICE_CERTS_DIR/cert.pem" 2>/dev/null || true
+fi
+if [ ! -f "$DEVICE_CERTS_DIR/key.pem" ] && [ -f "$CLIENT_DIR/key.pem" ]; then
+  cp -f "$CLIENT_DIR/key.pem" "$DEVICE_CERTS_DIR/key.pem" 2>/dev/null || true
+fi
+if [ ! -f "$DEVICE_CERTS_DIR/ca.pem" ] && [ -f "$CLIENT_DIR/ca.pem" ]; then
+  cp -f "$CLIENT_DIR/ca.pem" "$DEVICE_CERTS_DIR/ca.pem" 2>/dev/null || true
+elif [ ! -f "$DEVICE_CERTS_DIR/ca.pem" ] && [ -f "$CLIENT_DIR/cas.pem" ]; then
+  cp -f "$CLIENT_DIR/cas.pem" "$DEVICE_CERTS_DIR/ca.pem" 2>/dev/null || true
+fi
+
+# Ensure device-certs directory is accessible (0755 root:root)
+chmod 0755 "$DEVICE_CERTS_DIR" 2>/dev/null || true
+chmod 0600 "$DEVICE_CERTS_DIR"/*key*.pem "$DEVICE_CERTS_DIR"/*.key 2>/dev/null || true
+chmod 0644 "$DEVICE_CERTS_DIR"/*cert*.pem "$DEVICE_CERTS_DIR"/*.crt "$DEVICE_CERTS_DIR"/*ca*.pem 2>/dev/null || true
+
+# Enforce secure directory permissions (0700 root:root for private dirs)
 chmod 0700 "$ETC_OLG_DIR" "$CONFIG_DIR" "$CERTS_DIR" "$JWT_DIR" "$CLIENT_DIR" "$GUEST_SECRETS_DIR" 2>/dev/null || true
 
 # Seed baseline uCentral client configuration if missing
@@ -826,6 +875,10 @@ fi
 MAP_ENTRIES=()
 if [ -n "$WAN_PCI" ]; then
   wan_mac_fmt="${EXP_WAN_MAC:-$(get_pci_mac "$WAN_PCI" 2>/dev/null || true)}"
+  # If empty (e.g. WAN NIC already bound to vfio-pci on restart), preserve from existing interface map
+  if [ -z "$wan_mac_fmt" ] && [ -f "$INTERFACE_MAP_FILE" ]; then
+    wan_mac_fmt=$(jq -r '.mappings[]? | select(.role=="wan" or .vyos_port=="wan") | .mac_address // empty' "$INTERFACE_MAP_FILE" 2>/dev/null || true)
+  fi
   wan_entry="{\"host_port\": \"eth0\", \"pci_address\": \"${WAN_PCI}\""
   [ -n "$wan_mac_fmt" ] && wan_entry+=", \"mac_address\": \"${wan_mac_fmt}\""
   wan_entry+=", \"vyos_port\": \"wan\", \"role\": \"wan\"}"
@@ -839,6 +892,9 @@ if [ "$LAN_TYPE" = "pci" ] && [ "${#LAN_PCI_LIST[@]}" -gt 0 ]; then
     ENTRY_JSON=$(jq -c "if .lan_ports and (.lan_ports | type == \"array\") and (.lan_ports | length > 0) then .lan_ports[$idx] else .lan end" "$HARDWARE_PROFILE" 2>/dev/null || echo "{}")
     lan_mac=$(jq -r '.mac // empty' <<< "$ENTRY_JSON" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
     [ -z "$lan_mac" ] && lan_mac=$(get_pci_mac "$lan_pci" 2>/dev/null || true)
+    if [ -z "$lan_mac" ] && [ -f "$INTERFACE_MAP_FILE" ]; then
+      lan_mac=$(jq -r --arg pci "$lan_pci" '.mappings[]? | select(.pci_address==$pci) | .mac_address // empty' "$INTERFACE_MAP_FILE" 2>/dev/null || true)
+    fi
     lan_entry="{\"host_port\": \"eth${lan_idx}\", \"pci_address\": \"${lan_pci}\""
     [ -n "$lan_mac" ] && lan_entry+=", \"mac_address\": \"${lan_mac}\""
     lan_entry+=", \"vyos_port\": \"lan${lan_idx}\", \"role\": \"lan\"}"
@@ -857,9 +913,17 @@ fi
 
 MAPPINGS_JSON=$(IFS=,; echo "${MAP_ENTRIES[*]}")
 
+ALLOW_INF_FALLBACK="false"
+if [ -n "${HARDWARE_PROFILE:-}" ] && [ -f "$HARDWARE_PROFILE" ]; then
+  if [ "$(jq -r '.allow_inferred_fallback // false' "$HARDWARE_PROFILE" 2>/dev/null)" = "true" ]; then
+    ALLOW_INF_FALLBACK="true"
+  fi
+fi
+
 cat <<EOF > /etc/ucentral/interface_map.json.tmp
 {
   "serial": "${SYS_SERIAL}",
+  "allow_inferred_fallback": ${ALLOW_INF_FALLBACK},
   "mappings": [
     ${MAPPINGS_JSON}
   ]
@@ -868,6 +932,11 @@ EOF
 chmod 0644 /etc/ucentral/interface_map.json.tmp 2>/dev/null || true
 mv -f /etc/ucentral/interface_map.json.tmp "$INTERFACE_MAP_FILE"
 log_info "Reconciled interface map at $INTERFACE_MAP_FILE (serial: $SYS_SERIAL) [OK]."
+
+# Synchronize interface map to guest secrets for VyOS interface reconciliation
+cp -f "$INTERFACE_MAP_FILE" "$GUEST_SECRETS_DIR/interface_map.json"
+chmod 0644 "$GUEST_SECRETS_DIR/interface_map.json" 2>/dev/null || true
+log_info "Synchronized interface map to guest secrets at $GUEST_SECRETS_DIR/interface_map.json [OK]."
 
 cat <<EOF > "$GUEST_SECRETS_DIR/agent.env"
 NATS_SERVER=tls://192.168.254.2:4222
@@ -1110,7 +1179,7 @@ cat <<EOF > "$DOMAIN_XML_FILE"
       <listen type='address' address='127.0.0.1'/>
     </graphics>
     <video>
-      <model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1' primary='yes'/>
+      <model type='vga' vram='16384' heads='1' primary='yes'/>
     </video>
     <channel type='unix'>
       <source mode='bind'/>
@@ -1121,6 +1190,12 @@ cat <<EOF > "$DOMAIN_XML_FILE"
       <driver type='virtiofs'/>
       <source dir='/etc/olg/guest-secrets'/>
       <target dir='guest_secrets'/>
+      <readonly/>
+    </filesystem>
+    <filesystem type='mount' accessmode='passthrough'>
+      <driver type='virtiofs'/>
+      <source dir='/etc/olg/device-certs'/>
+      <target dir='device_certs'/>
       <readonly/>
     </filesystem>
 EOF
@@ -1181,7 +1256,8 @@ if ! virt-xml-validate "$DOMAIN_XML_FILE" domain >/dev/null 2>&1; then
   exit 1
 fi
 
-VM_STATE=$(virsh domstate vyos-router 2>/dev/null || echo "shut off")
+VM_STATE=$(virsh domstate vyos-router 2>/dev/null | tr -d '[:space:]' || true)
+[ -z "$VM_STATE" ] && VM_STATE="shut off"
 
 if [ "$VM_STATE" = "running" ] && [ "$FLAG_RECREATE_VM" = "true" ]; then
   log_info "Recreation requested: stopping running vyos-router instance..."

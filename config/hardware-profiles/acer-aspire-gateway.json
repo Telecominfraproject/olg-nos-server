@@ -1,0 +1,11 @@
+{
+  "model": "acer-aspire-gateway",
+  "version": "1.0.0",
+  "wan": {
+    "pci_bdf": "0000:07:00.0"
+  },
+  "lan": {
+    "type": "usb",
+    "usb_path": "1-4"
+  }
+}

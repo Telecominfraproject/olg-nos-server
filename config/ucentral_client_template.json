@@ -1,6 +1,6 @@
 {
   "cloud": {
-    "url": "wss://openwifi.wlan.local:15002",
+    "url": "wss://openwifi3.routerarchitects.com:15002",
     "connect_timeout_seconds": 10,
     "write_timeout_seconds": 10,
     "ping_interval_seconds": 30,
@@ -10,10 +10,10 @@
     "max_frame_size_bytes": 11534336,
     "max_consecutive_frame_errors": 20,
     "tls": {
-      "ca_file": "/etc/olg/client/ca.pem",
-      "client_cert_file": "/etc/olg/client/cert.pem",
-      "client_key_file": "/etc/olg/client/key.pem",
-      "server_name": "openwifi.wlan.local"
+      "ca_file": "/etc/olg/device-certs/ca.pem",
+      "client_cert_file": "/etc/olg/device-certs/cert.pem",
+      "client_key_file": "/etc/olg/device-certs/key.pem",
+      "server_name": "openwifi3.routerarchitects.com"
     }
   },
   "nats": {

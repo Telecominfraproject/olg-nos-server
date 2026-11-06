@@ -49,7 +49,7 @@ In the OpenLAN Gateway (OLG) architecture:
 * **Virtualization Stack**: `qemu-kvm` (>= 9.0.0), `libvirt-daemon-system` (>= 11.0.0 required for `<filesystem><driver type='virtiofs'/><readonly/></filesystem>` and shared memfd), `libvirt-clients`, `virtiofsd` (>= 1.13.0 required for `--readonly` VirtIO-FS), `virt-install`.
 * **Network Management**: `netplan.io`, `systemd-networkd`, `networkctl`, `net-tools`, `iproute2`, `iptables`.
 * **Container Runtime**: `docker.io`, `docker-compose` / `docker compose`.
-* **Router Image**: VyOS Golden Master QCOW2 Disk Image (`/opt/olg/images/vyos-golden.qcow2`) with pre-baked management interface (`eth3` at `192.168.254.1/24`), serial console (`ttyS0`), and `vyos-nats-agent.service`.
+* **Router Image**: VyOS Golden Master QCOW2 Disk Image (`/opt/olg/images/vyos-golden.qcow2`) with pre-baked management interface (`mgmt0` at `192.168.254.1/24`), serial console (`ttyS0`), and `vyos-nats-agent.service`.
 * **Auxiliary Utilities**: `dnsmasq`, `jq`, `usbutils`.
 
 ---
@@ -91,7 +91,7 @@ In the OpenLAN Gateway (OLG) architecture:
 │ │                                                    │   │      (Masquerade)   │ │
 │ │                                                    │   │           ▲         │ │
 │ │                                                    │   ▼           │         │ │
-│ │                                                    │  eth3 (MGMT) ─┤         │ │
+│ │                                                    │  mgmt0 (MGMT)─┤         │ │
 │ │                                                    │  (192.168.    │         │ │
 │ │                                                    │   254.1/24)   │         │ │
 │ │                                                    │               │         │ │
@@ -115,7 +115,7 @@ In the OpenLAN Gateway (OLG) architecture:
 | **`br0`** | VyOS Guest | Dynamic DHCP from ISP (Single Lease) | WAN Routing Bridge & Egress SNAT Outbound Interface (Rule 100) |
 | **`eth2`** | VyOS Guest | Member of `br1` | Physical LAN Interface (PCI Passthrough or USB Hostdev depending on topology) |
 | **`br1`** | VyOS Guest | `192.168.100.1/24` | LAN Switch Bridge & Kea DHCP Server (`listen-interface br1`) |
-| **`eth3`** | VyOS Guest | `192.168.254.1/24` | Management NIC (VirtIO TAP `vnet2` connected to `br-mgmt`) & Management Gateway |
+| **`mgmt0`** | VyOS Guest | `192.168.254.1/24` | Management NIC (VirtIO TAP `vnet2` connected to `br-mgmt`) & Management Gateway |
 | **`nats-server`** | Container | Docker Bridge (`veth`), Published at `192.168.254.2:4222` & `127.0.0.1:4222` | NATS JetStream KV Store (`cfg_desired` bucket) |
 | **`ucentral-client`**| Container | Docker Bridge (`veth`) | OpenWiFi Cloud Gateway WebSocket Agent (reaches NATS via Docker bridge, internet via Host GW) |
 
@@ -126,13 +126,13 @@ In the OpenLAN Gateway (OLG) architecture:
 > 1. **Hypervisor Hardware Address Pinning (`startup_node.sh`)**:
 >    - **WAN Controller**: Pinned via explicit PCI BDF `<address domain=... bus=... slot=... function=.../>` in Libvirt domain XML (`WAN_PCI_BDF`).
 >    - **LAN Controller**: Pinned via explicit PCI BDF (`LAN_PCI_BDF`) or explicit USB Bus & Device address `<address bus='$BUS' device='$DEV'/>` (`LAN_USB_BUS`, `LAN_USB_DEV`) in Libvirt domain XML.
->    - **Management TAP**: Pinned via static MAC `52:54:00:f9:ab:48` connected to `br-mgmt` on the host, bound to `eth3` via pre-baked `hw-id` in `/config/config.boot`.
+>    - **Management TAP**: Pinned via static MAC `52:54:00:f9:ab:48` connected to `br-mgmt` on the host, bound to `mgmt0` via udev rule and interface reconciliation.
 > 2. **Declarative Role-Based Port Mapping (`vyos_initial_state.json`)**:
 >    - The declarative state uses OpenWiFi uCentral port selectors:
 >      - `"select-ports": ["WAN*"]` $\longrightarrow$ dynamically maps the physical WAN interface (`eth0`) into WAN bridge `br0`.
 >      - `"select-ports": ["LAN2"]` $\longrightarrow$ dynamically maps the secondary physical LAN interface (`eth2`) into LAN switch bridge `br1`.
 >
-> This guarantees that regardless of hardware enumeration timing or PCI scanning order, the exact physical WAN port is attached to `br0`, the exact physical LAN port is attached to `br1`, and `eth3` remains the dedicated management gateway.
+> This guarantees that regardless of hardware enumeration timing or PCI scanning order, the exact physical WAN port is attached to `br0`, the exact physical LAN port is attached to `br1`, and `mgmt0` remains the dedicated management gateway.
 
 ### Single Upstream ISP DHCP Lease Architecture
 > [!NOTE]
@@ -151,7 +151,7 @@ In the OpenLAN Gateway (OLG) architecture:
 > **Host Management Bridge Model**:
 > `br-mgmt` is configured persistently by Netplan (`/etc/netplan/99-olg-bridges.yaml`) with static IP `192.168.254.2/24` and default route `default via 192.168.254.1`.
 >
-> Docker microservices (`nats-server` and `ucentral-client`) connect via `veth` pairs to a user-defined Docker bridge network. `nats-server` publishes port `4222` onto host IP `192.168.254.2` and loopback `127.0.0.1`. Host orchestration scripts communicate directly over `127.0.0.1:4222` / `192.168.254.2:4222`, while VyOS management interface `eth3` (`192.168.254.1`) connects across KVM TAP `vnet2` directly to `192.168.254.2:4222`.
+> Docker microservices (`nats-server` and `ucentral-client`) connect via `veth` pairs to a user-defined Docker bridge network. `nats-server` publishes port `4222` onto host IP `192.168.254.2` and loopback `127.0.0.1`. Host orchestration scripts communicate directly over `127.0.0.1:4222` / `192.168.254.2:4222`, while VyOS management interface `mgmt0` (`192.168.254.1`) connects across KVM TAP `vnet2` directly to `192.168.254.2:4222`.
 
 ---
 
@@ -199,7 +199,7 @@ olg-ubuntu-orchestrator/
 * Dynamically generates Libvirt domain XML containing PCI passthrough, static MACs, and native hypervisor crash handling (`<on_reboot>restart</on_reboot>`, `<on_crash>restart</on_crash>`), then defines and boots the VyOS KVM VM (`vyos-router`, preserving active instance if already running).
 
 ### 2. Declarative State Synchronization
-* VyOS boots up and initializes management interface `eth3` (`192.168.254.1/24`, MAC `52:54:00:f9:ab:48`) from its pre-baked local bootstrap configuration.
+* VyOS boots up and initializes management interface `mgmt0` (`192.168.254.1/24`, MAC `52:54:00:f9:ab:48`) from its internal management configuration.
 * `vyos-nats-agent.service` starts and connects across the active management interface to NATS JetStream on host (`192.168.254.2:4222`).
 * Agent fetches declarative cloud configuration (`desired.vyos`) from KV store bucket `cfg_desired`.
 * Agent configures WAN bridge `br0` containing physical WAN `eth0` (DHCP from ISP), LAN bridge `br1` (`192.168.100.1/24`), DHCP server, outbound SNAT masquerade rules (Rule 100 on `br0`), and `LAN_TO_MGMT` firewall policy.
@@ -217,7 +217,7 @@ To guarantee zero-touch boot persistence across cold host reboots and factory pr
 For factory provisioning and production appliance imaging, the orchestrator scripts, VyOS Golden Master QCOW2 image (`/opt/olg/images/vyos-golden.qcow2`), Docker container images, all system packages, default configuration templates (`config/`), and systemd unit file are pre-packaged into the host OS disk image and pinned via `/opt/olg/build-manifest.json`:
 1. **Immutable Container Images & Golden QCOW2 Image Verification**:
    - Container images are pinned with explicit version tags and SHA-256 digests (`nats:<version>@sha256:<digest>`, `ucentral-client:<version>@sha256:<digest>`), pre-loaded directly into local Docker storage.
-   - VyOS Golden Master QCOW2 image (`/opt/olg/images/vyos-golden.qcow2`) is pre-baked with management interface `eth3` (`192.168.254.1/24`), serial console (`ttyS0`), `qemu-guest-agent` (`systemctl enable qemu-guest-agent.service`), and `vyos-nats-agent.service`. The parent directory `/opt/olg/images/` is owned by `root:kvm` (or `root:libvirt-qemu`) with directory mode **`1775`** (`rwxrwxr-t` with sticky bit set) to allow Libvirt/QEMU to create and manage its own ephemeral transient overlay beside the backing file, while strictly preventing non-root processes from unlinking, renaming, or replacing `root`-owned files. The master image file itself and its SHA-256 checksum are strictly secured as read-only mode **`0444 root:root`**, verified via cryptographic checksum (`/opt/olg/images/vyos-golden.qcow2.sha256`) before every boot, and cannot ever be modified in place (upgrades install a new versioned file and atomically swap the active reference).
+   - VyOS Golden Master QCOW2 image (`/opt/olg/images/vyos-golden.qcow2`) is pre-baked with management interface `mgmt0` (`192.168.254.1/24`), serial console (`ttyS0`), `qemu-guest-agent` (`systemctl enable qemu-guest-agent.service`), and `vyos-nats-agent.service`. The parent directory `/opt/olg/images/` is owned by `root:kvm` (or `root:libvirt-qemu`) with directory mode **`1775`** (`rwxrwxr-t` with sticky bit set) to allow Libvirt/QEMU to create and manage its own ephemeral transient overlay beside the backing file, while strictly preventing non-root processes from unlinking, renaming, or replacing `root`-owned files. The master image file itself and its SHA-256 checksum are strictly secured as read-only mode **`0444 root:root`**, verified via cryptographic checksum (`/opt/olg/images/vyos-golden.qcow2.sha256`) before every boot, and cannot ever be modified in place (upgrades install a new versioned file and atomically swap the active reference).
    - **Secretless Golden Image Contract**: `vyos-golden.qcow2` is 100% generic, immutable, and secretless across all appliances. It contains no pre-baked per-device passwords, tokens, or private keys.
     - The virtual machine is configured with native Libvirt `<transient/>` disk overlay: QEMU opens the golden master image strictly read-only, routes runtime ephemeral writes to a temporary overlay (`vyos-golden.qcow2.TRANSIENT-vyos-router`), and prevents guest runtime writes from modifying the golden QCOW2 backing image. Under native Libvirt `<transient/>` disk handling (`libvirt-daemon-system >= 11.0.0`), Libvirt natively unlinks any orphaned transient overlay prior to creating a fresh ephemeral instance on domain start. Manual unlinking, modification, or deletion of `.TRANSIENT-*` overlay files is strictly prohibited whenever the VM is active or in any non-stopped state (`running`, `paused`, `pmsuspended`, `blocked`, `in shutdown`, `crashed`).
 2. **Host-to-Guest Per-Device Credential Delivery via Read-Only `virtiofs` & Directory Mounts**:
@@ -259,7 +259,7 @@ For factory provisioning and production appliance imaging, the orchestrator scri
 
 #### Native Hypervisor Crash Recovery & Invariant Rendering
 1. **Misconfiguration Prevention & Invariant Validation Contract**:
-   - **Immutable Invariants**: Core management connectivity (`eth3` at `192.168.254.1/24`), WAN bridge routing (`br0`), outbound SNAT masquerade rules (Rule 100 on `br0`), and `LAN_TO_MGMT` inter-zone firewall policy (`192.168.100.0/24` -> `192.168.254.0/24` drop) are enforced as immutable invariants at the config rendering agent level.
+   - **Immutable Invariants**: Core management connectivity (`mgmt0` at `192.168.254.1/24`), WAN bridge routing (`br0`), outbound SNAT masquerade rules (Rule 100 on `br0`), and `LAN_TO_MGMT` inter-zone firewall policy (`192.168.100.0/24` -> `192.168.254.0/24` drop) are enforced as immutable invariants at the config rendering agent level.
    - **Validation & Conflicting State Rejection**: The configuration rendering agent validates incoming desired states (`desired.vyos`) prior to commit. If a cloud desired configuration attempts to modify, overwrite, or remove any immutable invariant, the rendering agent **rejects the conflicting configuration**, **preserves the active configuration**, and publishes a validation error to NATS status/result subjects.
    - **Non-Persistence of Cloud Configuration**: The renderer MUST commit cloud-managed configuration to the running configuration but MUST NOT save cloud-managed configuration to `/config/config.boot`, preserving cold-boot statelessness.
 2. **Native KVM/Libvirt Crash Recovery**: If the VyOS guest kernel panics or crashes, Libvirt automatically intercepts the event and restarts the VM via `<on_crash>restart</on_crash>` and `<on_reboot>restart</on_reboot>` configured in the domain XML to boot the VM back up.
@@ -269,7 +269,7 @@ For factory provisioning and production appliance imaging, the orchestrator scri
 
 ## 6. Summary of Architectural Requirements & Design Objectives
 
-1. **State Preservation & Invariant Rendering Requirement**: The deployment and recovery lifecycle MUST preserve committed configurations in NATS JetStream. The configuration rendering agent MUST validate incoming state against immutable invariants (`192.168.254.1/24` on `eth3`, `br0` WAN routing, SNAT Rule 100 on `br0`, and `LAN_TO_MGMT` firewall policy), rejecting conflicting payloads and preserving active configuration on violation. Cloud configurations MUST be committed to running memory only and MUST NOT be saved to `/config/config.boot`.
+1. **State Preservation & Invariant Rendering Requirement**: The deployment and recovery lifecycle MUST preserve committed configurations in NATS JetStream. The configuration rendering agent MUST validate incoming state against immutable invariants (`192.168.254.1/24` on `mgmt0`, `br0` WAN routing, SNAT Rule 100 on `br0`, and `LAN_TO_MGMT` firewall policy), rejecting conflicting payloads and preserving active configuration on violation. Cloud configurations MUST be committed to running memory only and MUST NOT be saved to `/config/config.boot`.
 2. **Native Hypervisor Crash Recovery Requirement**: The virtualized router domain MUST configure native Libvirt crash recovery (`<on_crash>restart</on_crash>` and `<on_reboot>restart</on_reboot>`) directly within its dynamically generated domain XML, ensuring the VM automatically boots back up upon guest crash or kernel panic without requiring external supervisor scripts.
 3. **Telemetry-Driven Health Monitoring Requirement**: Passive link latency and packet loss telemetry MUST be decoupled from router lifecycle management, preventing false-positive VM restarts during upstream ISP outages.
 4. **Control Plane Security & Isolation Requirement**: `nats-server` MUST be published exclusively on management IP `192.168.254.2:4222` and localhost `127.0.0.1:4222` (WAN and LAN listeners strictly prohibited) with mandatory cryptographic NATS 2.0+ Operator/Account JWT authentication and subject authorization (mounted via directory bind mounts `/opt/olg/config:/etc/nats:ro` and `/etc/olg/client:/etc/olg/client:ro`) enforcing least-privilege publish/subscribe subject allow lists between orchestrator bootstrap, cloud-facing uCentral gateway, and VyOS agent components, backed by persistent host volume storage (`/opt/olg/data/nats:/data/jetstream`). Host secrets directories MUST be secured with permissions `0700` and secret files with `0600` owned by `root:root`. VyOS MUST enforce ingress firewall rules blocking traffic from the LAN subnet (`192.168.100.0/24`) to the Management subnet (`192.168.254.0/24`).

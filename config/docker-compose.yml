@@ -26,6 +26,7 @@ services:
     restart: unless-stopped
     volumes:
       - /etc/olg/client:/etc/olg/client:ro
+      - /etc/olg/device-certs:/etc/olg/device-certs:ro
       - /etc/ucentral:/etc/ucentral:ro
     environment:
       - OW_INTERFACE_MAP_FILE=/etc/ucentral/interface_map.json
