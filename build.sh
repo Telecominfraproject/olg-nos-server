@@ -67,12 +67,12 @@ if [ ! -f /.dockerenv ] && [ "${OLG_CONTAINER_BUILD:-false}" != "true" ]; then
         chmod 644 /root/.ssh/*.pub 2>/dev/null || true
       fi
       [ -f /root/.gitconfig.host ] && cp -f /root/.gitconfig.host /root/.gitconfig 2>/dev/null || true
-      echo -e "\033[1;32m[OLG-BUILD]\033[0m Initializing container packages (go, qemu, xorriso, docker, ssh, patch, python3-yaml)..."
+      echo -e "\033[1;32m[OLG-BUILD]\033[0m Initializing container packages (go, qemu, xorriso, docker, ssh, patch, python3-yaml, pexpect, squashfs)..."
       apt-get update -qq
       apt-get install -y --no-install-recommends \
-        golang-go qemu-utils xorriso p7zip-full docker.io \
-        curl git jq python3 python3-yaml ca-certificates kmod file bc sudo \
-        openssh-client patch
+        golang-go qemu-utils qemu-system-x86 xorriso p7zip-full docker.io \
+        curl git jq python3 python3-yaml python3-pexpect ca-certificates kmod file bc sudo \
+        openssh-client patch squashfs-tools
       echo -e "\033[1;32m[OLG-BUILD]\033[0m Build container toolchain ready. Starting build..."
       exec ./build.sh "$@"
     ' bash "$@"
@@ -114,6 +114,7 @@ MODE_ALL=true
 MODE_VYOS=true
 MODE_ISO=true
 REFRESH_DEBS=false
+CLI_BUILD_MODE=""
 
 usage() {
   cat <<EOF
@@ -122,6 +123,8 @@ Usage: $0 [OPTIONS]
 OpenLAN Gateway (OLG) Master Unified Appliance Builder
 
 Options:
+  --dev                 Build in development mode (enables default 'vyos' credentials for local testing)
+  --production          Build in production mode (default: secure-by-default, no reusable default credentials)
   --vyos-only           Build only the VyOS Golden Master Disk
   --iso-only            Build only the Enterprise Appliance ISO (requires vyos-golden.qcow2)
   --refresh-debs        Force refresh/regeneration of offline Debian packages cache
@@ -133,6 +136,14 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --dev)
+      CLI_BUILD_MODE="dev"
+      shift
+      ;;
+    --production)
+      CLI_BUILD_MODE="production"
+      shift
+      ;;
     --vyos-only)
       MODE_VYOS=true
       MODE_ISO=false
@@ -182,6 +193,14 @@ with open('$MANIFEST_FILE') as f:
     cfg = yaml.safe_load(f)
 print(json.dumps(cfg))
 ")
+
+# Determine Firmware Build Mode (production vs dev)
+CONFIG_BUILD_MODE=$(jq -r '.build_mode // "production"' <<< "$MANIFEST_JSON")
+BUILD_MODE="${CLI_BUILD_MODE:-$CONFIG_BUILD_MODE}"
+if [ "$BUILD_MODE" != "dev" ] && [ "$BUILD_MODE" != "production" ]; then
+  err "Invalid build_mode: '$BUILD_MODE' (must be 'dev' or 'production')"
+fi
+log "Firmware build mode configured: [${BUILD_MODE^^}] (CLI: '${CLI_BUILD_MODE:-none}', Manifest: '${CONFIG_BUILD_MODE}')"
 
 # Global paths & cleanup state tracking
 BUILD_DIR="${SCRIPT_DIR}/build"
@@ -292,7 +311,7 @@ export GIT_TERMINAL_PROMPT=0
 # 1. Dependency Validation
 # ------------------------------------------------------------------------------
 log "Validating host build dependencies..."
-REQUIRED_TOOLS=(xorriso 7z sha256sum curl go docker qemu-img qemu-nbd patch git jq)
+REQUIRED_TOOLS=(xorriso 7z sha256sum curl go docker qemu-img qemu-nbd qemu-system-x86_64 patch git jq unsquashfs python3)
 MISSING_TOOLS=()
 for tool in "${REQUIRED_TOOLS[@]}"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -300,7 +319,14 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
   fi
 done
 
-if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
+MISSING_PY_MODULES=()
+if command -v python3 >/dev/null 2>&1; then
+  if ! python3 -c "import pexpect" >/dev/null 2>&1; then
+    MISSING_PY_MODULES+=(python3-pexpect)
+  fi
+fi
+
+if [ ${#MISSING_TOOLS[@]} -gt 0 ] || [ ${#MISSING_PY_MODULES[@]} -gt 0 ]; then
   pkgs_to_install=()
   for t in "${MISSING_TOOLS[@]}"; do
     case "$t" in
@@ -310,19 +336,25 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
       go) pkgs_to_install+=(golang-go) ;;
       docker) pkgs_to_install+=(docker.io) ;;
       qemu-img|qemu-nbd) pkgs_to_install+=(qemu-utils) ;;
+      qemu-system-x86_64) pkgs_to_install+=(qemu-system-x86) ;;
       patch) pkgs_to_install+=(patch) ;;
       git) pkgs_to_install+=(git) ;;
       jq) pkgs_to_install+=(jq) ;;
+      unsquashfs) pkgs_to_install+=(squashfs-tools) ;;
+      python3) pkgs_to_install+=(python3) ;;
     esac
+  done
+  for m in "${MISSING_PY_MODULES[@]}"; do
+    pkgs_to_install+=("$m")
   done
   pkgs_to_install=($(printf "%s\n" "${pkgs_to_install[@]}" | sort -u))
 
   if [ "${EUID:-$(id -u)}" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
-    log "Auto-installing missing tools: ${MISSING_TOOLS[*]} (${pkgs_to_install[*]})..."
+    log "Auto-installing missing dependencies: ${MISSING_TOOLS[*]} ${MISSING_PY_MODULES[*]} (${pkgs_to_install[*]})..."
     sudo apt-get update -y
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs_to_install[@]}"
   else
-    err "Missing tools: ${MISSING_TOOLS[*]}. Install them before proceeding: ${pkgs_to_install[*]}"
+    err "Missing dependencies: ${MISSING_TOOLS[*]} ${MISSING_PY_MODULES[*]}. Install them before proceeding: ${pkgs_to_install[*]}"
   fi
 fi
 
@@ -386,7 +418,7 @@ resolve_and_apply_patches() {
 
 # ==============================================================================
 # Helper: Provenance Manifest Generator
-# Generates a comprehensive SBOM and provenance manifest (provenance.json)
+# Generates a comprehensive SBOM and provenance manifest (image_details.json)
 # capturing inputs, commits, container digests, base image checksums, and outputs
 # ==============================================================================
 generate_provenance_manifest() {
@@ -485,6 +517,422 @@ generate_provenance_manifest() {
 }
 
 # ==============================================================================
+# Helper: Convert VyOS Live/Installer ISO to Bootable QCOW2 Disk
+# Performs automated unattended installation in headless QEMU
+# ==============================================================================
+convert_vyos_iso_to_qcow2() {
+  local iso_path="$1"
+  local output_qcow2="$2"
+  local disk_size="${3:-10G}"
+  local admin_password="${4:-vyos}"
+
+  log "Creating blank ${disk_size} QCOW2 virtual disk at: ${output_qcow2}..."
+  mkdir -p "$(dirname "$output_qcow2")"
+  rm -f "$output_qcow2"
+  qemu-img create -f qcow2 "$output_qcow2" "$disk_size" >/dev/null
+
+  log "Launching automated headless QEMU installer from ${iso_path}..."
+  log "Installing partitions, GRUB, and VyOS system (typically takes 60-90s)..."
+
+  local accel="tcg"
+  if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then
+    accel="kvm"
+  fi
+
+  python3 - "$iso_path" "$output_qcow2" "$accel" 3<<<"$admin_password" <<'EOF_INSTALL_PY'
+import sys, os, time, re
+try:
+    import pexpect
+except ImportError:
+    print("[ERROR] python3-pexpect is required for automated VyOS ISO installation. Please install python3-pexpect.", file=sys.stderr)
+    sys.exit(1)
+
+iso_file = sys.argv[1]
+disk_file = sys.argv[2]
+accel = sys.argv[3]
+
+# Read admin_password from private file descriptor 3 to prevent exposing secrets in /proc/<pid>/cmdline
+admin_password = ""
+if len(sys.argv) > 4:
+    admin_password = sys.argv[4]
+else:
+    try:
+        with os.fdopen(3, "r") as f:
+            admin_password = f.read().rstrip("\r\n")
+    except Exception:
+        admin_password = "vyos"
+
+qemu_cmd = [
+    "qemu-system-x86_64",
+    "-m", "2048",
+    "-smp", "2",
+    "-drive", f"file={disk_file},format=qcow2,if=virtio",
+    "-cdrom", iso_file,
+    "-boot", "d",
+    "-display", "none",
+    "-serial", "stdio",
+    "-monitor", "none",
+    "-net", "none",
+]
+if accel == "kvm":
+    qemu_cmd.extend(["-accel", "kvm", "-accel", "tcg"])
+else:
+    qemu_cmd.extend(["-accel", "tcg"])
+
+print(f"[OLG-BUILD] Spawning QEMU installer process (accel={accel})...", flush=True)
+child = pexpect.spawn(qemu_cmd[0], qemu_cmd[1:], timeout=120, encoding="utf-8")
+
+patterns = [
+    r"vyos login:\s*",                                      # 0: Live login
+    r"[Pp]assword:\s*",                                     # 1: Password prompt (live login or installer)
+    r"vyos@vyos:.*[#$]\s*",                                 # 2: Shell prompt
+    r"\[[yY]/?[nN]?\]\s*",                                  # 3: Any Yes/No confirmation prompt
+    r"[Pp]lease.*password.*:\s*",                           # 4: Password setup or confirm
+    r"\(Default:.*?\)\s*",                                  # 5: Any question with default option
+    r"(The image installed successfully|Installation finished|Installed image:|[sS]uccessfully installed).*", # 6: Success notification
+    r"[Pp]artition.*\(Auto/Parted/Skip\).*:\s*",            # 7: Legacy 1.4 partition prompt
+    r"[Ee]nter.*password for user.*:\s*",                   # 8: Legacy 1.4 password
+    r"[Rr]etype.*password for user.*:\s*",                  # 9: Legacy 1.4 confirm password
+    r"GRUB _",                                              # 10: Legacy GRUB prompt
+    r"\[vda\]:\s*",                                         # 11: Drive selection prompt
+    pexpect.TIMEOUT,                                        # 12
+    pexpect.EOF                                             # 13
+]
+
+install_started = False
+install_success_seen = False
+install_completed = False
+start_time = time.time()
+
+while True:
+    if time.time() - start_time > 300:
+        print("\n[ERROR] Automated VyOS installation timed out after 5 minutes.", file=sys.stderr)
+        child.kill(9)
+        sys.exit(1)
+
+    try:
+        idx = child.expect(patterns, timeout=60)
+    except pexpect.TIMEOUT:
+        child.send("\r")
+        continue
+    except pexpect.EOF:
+        if install_completed and install_success_seen:
+            break
+        print("\n[ERROR] QEMU terminated prematurely before installation finished.", file=sys.stderr)
+        sys.exit(1)
+
+    if idx == 0:  # vyos login:
+        print("[OLG-BUILD] Live ISO booted. Logging in as 'vyos'...", flush=True)
+        child.send("vyos\r")
+    elif idx == 1:  # Password prompt (stage-aware)
+        if not install_started:
+            print("[OLG-BUILD] Submitting Live ISO console password 'vyos'...", flush=True)
+            child.send("vyos\r")
+        else:
+            print("[OLG-BUILD] Setting VyOS administrative user password from manifest...", flush=True)
+            child.send(f"{admin_password}\r")
+    elif idx == 2:  # vyos@vyos:~$
+        if not install_started:
+            print("[OLG-BUILD] Starting unattended 'install image' wizard...", flush=True)
+            install_started = True
+            child.send("install image\r")
+        else:
+            if not install_success_seen:
+                print("\n[ERROR] Installer exited back to shell prematurely without a verified success signal!", file=sys.stderr)
+                child.kill(9)
+                sys.exit(1)
+            print("[OLG-BUILD] Installation wizard finished successfully and returned to shell. Powering off installer VM...", flush=True)
+            install_completed = True
+            child.send("sudo poweroff\r")
+            time.sleep(2)
+            try:
+                child.expect(pexpect.EOF, timeout=30)
+            except Exception:
+                child.kill(9)
+            break
+    elif idx == 3:  # Any [y/N] prompt
+        print("[OLG-BUILD] Prompt: Answering Yes to confirmation prompt", flush=True)
+        child.send("y\r")
+    elif idx == 4 or idx == 8 or idx == 9:  # Enter or confirm password
+        print("[OLG-BUILD] Setting VyOS administrative user password from manifest...", flush=True)
+        child.send(f"{admin_password}\r")
+    elif idx == 5 or idx == 11:  # Default option or drive prompt
+        child.send("\r")
+    elif idx == 6:  # Installation completed
+        print("[OLG-BUILD] VyOS image installation reported SUCCESS signal.", flush=True)
+        install_success_seen = True
+    elif idx == 7:  # Legacy 1.4: Partition scheme -> Auto
+        child.send("Auto\r")
+    elif idx == 10:  # Legacy 1.4: GRUB
+        child.send("\r")
+    elif idx == 12:  # TIMEOUT
+        child.send("\r")
+    elif idx == 13:  # EOF
+        if install_completed and install_success_seen:
+            break
+        print("\n[ERROR] QEMU terminated prematurely before installation finished.", file=sys.stderr)
+        child.kill(9)
+        sys.exit(1)
+
+if not install_completed or not install_success_seen:
+    print("\n[ERROR] VyOS automated installation assertion failed (incomplete or unverified).", file=sys.stderr)
+    sys.exit(1)
+
+print(f"[OLG-BUILD] Automated VyOS installation successfully generated {disk_file} in {int(time.time() - start_time)}s.")
+EOF_INSTALL_PY
+
+  if [ ! -f "$output_qcow2" ] || [ "$(stat -c%s "$output_qcow2" 2>/dev/null || echo 0)" -lt 1000000 ]; then
+    err "Automated VyOS ISO conversion failed. Resulting QCOW2 disk is missing or invalid."
+  fi
+
+  log "Validating newly converted VyOS QCOW2 virtual disk with qemu-img check..."
+  if ! qemu-img check -q "$output_qcow2" >/dev/null 2>&1; then
+    rm -f "$output_qcow2"
+    err "Automated VyOS ISO conversion produced an invalid or corrupted QCOW2 disk according to qemu-img check."
+  fi
+
+  log "Validating that newly converted disk boots standalone and authenticates with configured credentials..."
+  python3 - "$output_qcow2" "$accel" 3<<<"$admin_password" <<'EOF_BOOT_CHECK_PY'
+import sys, os, time, re
+try:
+    import pexpect
+except ImportError:
+    sys.exit(0)
+
+disk_file = sys.argv[1]
+accel = sys.argv[2]
+admin_password = ""
+if len(sys.argv) > 3:
+    admin_password = sys.argv[3]
+else:
+    try:
+        with os.fdopen(3, "r") as f:
+            admin_password = f.read().rstrip("\r\n")
+    except Exception:
+        admin_password = "vyos"
+
+qemu_cmd = [
+    "qemu-system-x86_64",
+    "-m", "2048",
+    "-smp", "2",
+    "-drive", f"file={disk_file},format=qcow2,if=virtio",
+    "-boot", "c",
+    "-display", "none",
+    "-serial", "stdio",
+    "-monitor", "none",
+    "-net", "none",
+]
+if accel == "kvm":
+    qemu_cmd.extend(["-accel", "kvm", "-accel", "tcg"])
+else:
+    qemu_cmd.extend(["-accel", "tcg"])
+
+print(f"[OLG-BUILD] Testing standalone VM boot & console credentials from {disk_file} (no CD-ROM)...", flush=True)
+child = pexpect.spawn(qemu_cmd[0], qemu_cmd[1:], timeout=90, encoding="utf-8")
+boot_patterns = [
+    r"(vyos login:|login:)\s*",           # 0
+    r"[Pp]assword:\s*",                  # 1
+    r"vyos@vyos:.*[#$]\s*",              # 2
+    r"(Login incorrect|invalid login)",  # 3
+    pexpect.TIMEOUT,                     # 4
+    pexpect.EOF,                         # 5
+]
+
+default_rejected = False
+auth_success = False
+
+try:
+    while True:
+        idx = child.expect(boot_patterns, timeout=90)
+        if idx == 0:  # login prompt
+            child.send("vyos\r")
+        elif idx == 1:  # password prompt
+            if admin_password != "vyos" and not default_rejected:
+                # In production mode: First attempt default password 'vyos' to assert it is rejected
+                child.send("vyos\r")
+            else:
+                # Submit configured admin_password
+                child.send(f"{admin_password}\r")
+        elif idx == 2:  # shell prompt
+            if admin_password != "vyos" and not default_rejected:
+                print("\n[ERROR] Security Assertion Failed: Default credentials 'vyos' were accepted!", file=sys.stderr)
+                child.kill(9)
+                sys.exit(1)
+            auth_success = True
+            print("[OLG-BUILD] Standalone VyOS disk boot test PASSED: Authenticated with configured admin_password.", flush=True)
+            child.send("sudo poweroff\r")
+            time.sleep(1)
+            child.kill(9)
+            sys.exit(0)
+        elif idx == 3:  # Login incorrect
+            default_rejected = True
+            print("[OLG-BUILD] Confirmed rejection of default credentials ('vyos').", flush=True)
+        elif idx == 4:  # TIMEOUT
+            print("\n[ERROR] Standalone VyOS disk boot test FAILED: Timed out waiting for login/shell prompt.", file=sys.stderr)
+            child.kill(9)
+            sys.exit(1)
+        elif idx == 5:  # EOF
+            if auth_success:
+                sys.exit(0)
+            print("\n[ERROR] Standalone VyOS disk boot test FAILED: QEMU terminated prematurely without authenticating.", file=sys.stderr)
+            child.kill(9)
+            sys.exit(1)
+except Exception as e:
+    print(f"\n[ERROR] Standalone VyOS disk boot test exception: {e}", file=sys.stderr)
+    child.kill(9)
+    sys.exit(1)
+EOF_BOOT_CHECK_PY
+
+  if [ $? -ne 0 ]; then
+    rm -f "$output_qcow2"
+    err "Newly converted VyOS disk failed standalone boot verification."
+  fi
+  log "VyOS base QCOW2 disk generated, boot-tested, and validated successfully at: ${output_qcow2}"
+}
+
+# ==============================================================================
+# Helper: Parse config.boot and update only 'system login user vyos' encrypted-password
+# Accurately scopes updates to user 'vyos', preserves other accounts, and asserts
+# exactly one modification occurred.
+# ==============================================================================
+update_vyos_config_boot_password() {
+  local cfg_file="$1"
+  local new_hash="$2"
+
+  local SUDO_PREFIX=""
+  if [ "$(id -u)" -ne 0 ] && [ ! -w "$cfg_file" ]; then
+    SUDO_PREFIX="sudo"
+  fi
+
+  $SUDO_PREFIX python3 - "$cfg_file" "$new_hash" <<'EOF_UPDATE_CFG_BOOT'
+import sys, re
+
+cfg_file = sys.argv[1]
+new_hash = sys.argv[2]
+
+with open(cfg_file, 'r', encoding='utf-8', errors='replace') as f:
+    lines = f.readlines()
+
+out = []
+stack = []
+modified_count = 0
+
+for line in lines:
+    stripped = line.strip()
+
+    is_vyos_auth = False
+    if len(stack) >= 4:
+        s0 = stack[0].lower()
+        s1 = stack[1].lower()
+        s2 = stack[2].lower()
+        s3 = stack[3].lower()
+        if s0 == 'system' and s1 == 'login' and bool(re.match(r'^user\s+[\'\"]?vyos[\'\"]?', s2)) and s3 == 'authentication':
+            is_vyos_auth = True
+
+    if is_vyos_auth and stripped.startswith('encrypted-password'):
+        indent = line[:line.find('encrypted-password')]
+        out.append(f"{indent}encrypted-password '{new_hash}'\n")
+        modified_count += 1
+        continue
+
+    out.append(line)
+
+    in_quote = False
+    quote_char = ''
+    last_start = 0
+    for i, ch in enumerate(stripped):
+        if ch in ('"', "'"):
+            if not in_quote:
+                in_quote = True
+                quote_char = ch
+            elif ch == quote_char:
+                in_quote = False
+        elif not in_quote:
+            if ch == '{':
+                header = stripped[last_start:i].strip()
+                stack.append(header)
+                last_start = i + 1
+            elif ch == '}':
+                if stack:
+                    stack.pop()
+                last_start = i + 1
+
+if modified_count != 1:
+    sys.stderr.write(f"ERROR: Expected exactly 1 'system login user vyos' encrypted-password in {cfg_file}, but found and modified {modified_count}.\n")
+    sys.exit(1)
+
+with open(cfg_file, 'w', encoding='utf-8') as f:
+    f.writelines(out)
+EOF_UPDATE_CFG_BOOT
+}
+
+# ==============================================================================
+# Helper: Parse config.boot and extract only 'system login user vyos' encrypted-password
+# ==============================================================================
+extract_vyos_config_boot_password() {
+  local cfg_file="$1"
+
+  local SUDO_PREFIX=""
+  if [ "$(id -u)" -ne 0 ] && [ ! -r "$cfg_file" ]; then
+    SUDO_PREFIX="sudo"
+  fi
+
+  $SUDO_PREFIX python3 - "$cfg_file" <<'EOF_EXTRACT_CFG_BOOT'
+import sys, re
+
+cfg_file = sys.argv[1]
+with open(cfg_file, 'r', encoding='utf-8', errors='replace') as f:
+    lines = f.readlines()
+
+stack = []
+found_hashes = []
+
+for line in lines:
+    stripped = line.strip()
+
+    is_vyos_auth = False
+    if len(stack) >= 4:
+        s0 = stack[0].lower()
+        s1 = stack[1].lower()
+        s2 = stack[2].lower()
+        s3 = stack[3].lower()
+        if s0 == 'system' and s1 == 'login' and bool(re.match(r'^user\s+[\'\"]?vyos[\'\"]?', s2)) and s3 == 'authentication':
+            is_vyos_auth = True
+
+    if is_vyos_auth and stripped.startswith('encrypted-password'):
+        m = re.search(r'encrypted-password\s+[\'\"]?([^\'\"\s]+)[\'\"]?', stripped)
+        if m:
+            found_hashes.append(m.group(1))
+
+    in_quote = False
+    quote_char = ''
+    last_start = 0
+    for i, ch in enumerate(stripped):
+        if ch in ('"', "'"):
+            if not in_quote:
+                in_quote = True
+                quote_char = ch
+            elif ch == quote_char:
+                in_quote = False
+        elif not in_quote:
+            if ch == '{':
+                header = stripped[last_start:i].strip()
+                stack.append(header)
+                last_start = i + 1
+            elif ch == '}':
+                if stack:
+                    stack.pop()
+                last_start = i + 1
+
+if len(found_hashes) != 1:
+    sys.stderr.write(f"ERROR: Expected exactly 1 encrypted-password for 'system login user vyos' in {cfg_file}, found {len(found_hashes)}.\n")
+    sys.exit(1)
+
+print(found_hashes[0])
+EOF_EXTRACT_CFG_BOOT
+}
+
+# ==============================================================================
 # STEP 1: Build VyOS Golden Master Disk
 # ==============================================================================
 build_vyos() {
@@ -500,27 +948,140 @@ build_vyos() {
   base_url=$(jq -r '.base_image.url // empty' <<< "$vyos_json")
   local base_sha256
   base_sha256=$(jq -r '.base_image.sha256 // empty' <<< "$vyos_json")
-  local cached_base="${CACHE_DIR}/${base_name}"
+  local disk_size
+  disk_size=$(jq -r '.base_image.disk_size // .disk_size // "10G"' <<< "$vyos_json")
+  local admin_password
+  admin_password=$(jq -r '.base_image.admin_password // .admin_password // empty' <<< "$vyos_json")
+
+  if [ "$BUILD_MODE" = "production" ]; then
+    # In production mode: Reusable default credentials ('vyos') are strictly prohibited
+    if [ -z "$admin_password" ] || [ "$admin_password" = "vyos" ]; then
+      err "Production build security policy violation: Reusable default credentials ('vyos') or empty passwords are prohibited. Please specify a secure custom admin_password in build.yaml (or build with --dev for local testing)."
+    fi
+  else
+    # In dev mode: Allow default development credentials for local testing
+    [ -z "$admin_password" ] && admin_password="vyos"
+  fi
+  local install_password="$admin_password"
   local golden_disk="${OUTPUT_DIR}/vyos-golden.qcow2"
 
-  if [ ! -f "$cached_base" ]; then
-    if [ -n "$base_url" ]; then
-      log "Downloading VyOS base disk from $base_url..."
-      curl --fail -L -C - -o "$cached_base" "$base_url"
-    else
-      err "VyOS base disk not found in cache ($cached_base) and no base_image.url configured in manifest."
-    fi
+  local is_iso=false
+  if [[ "$base_name" == *.iso ]] || [[ "$base_url" == *.iso* ]]; then
+    is_iso=true
   fi
 
-  # Validate base VyOS image checksum if declared
-  if [ -n "$base_sha256" ]; then
-    log "Verifying SHA-256 checksum for VyOS base disk: ${cached_base}..."
-    local act_base_sha
-    act_base_sha=$(sha256sum "$cached_base" | awk '{print $1}')
-    if [ "$act_base_sha" != "$base_sha256" ]; then
-      err "VyOS base disk SHA-256 checksum mismatch! Expected: ${base_sha256}, Got: ${act_base_sha}"
+  local cached_base=""
+  local cached_iso=""
+  local act_iso_sha=""
+  if [ "$is_iso" = "true" ]; then
+    local iso_cache_name="${base_name}"
+    [[ "$iso_cache_name" != *.iso ]] && iso_cache_name="vyos-installer.iso"
+    cached_iso="${CACHE_DIR}/${iso_cache_name}"
+
+    # 1. Download ISO if missing
+    if [ ! -f "$cached_iso" ]; then
+      if [ -n "$base_url" ]; then
+        log "Downloading VyOS installer ISO from $base_url..."
+        curl --fail -L -C - -o "$cached_iso" "$base_url"
+      else
+        err "VyOS installer ISO not found in cache ($cached_iso) and no base_image.url configured in manifest."
+      fi
     fi
-    log "VyOS base disk checksum verified [OK]."
+
+    # 2. Compute ISO checksum and validate against manifest if declared
+    log "Computing SHA-256 checksum for source VyOS installer ISO: ${cached_iso}..."
+    local act_iso_sha
+    act_iso_sha=$(sha256sum "$cached_iso" | awk '{print $1}')
+    if [ -n "$base_sha256" ]; then
+      if [ "$act_iso_sha" != "$base_sha256" ]; then
+        err "VyOS installer ISO SHA-256 checksum mismatch! Expected: ${base_sha256}, Got: ${act_iso_sha}"
+      fi
+      log "VyOS installer ISO checksum verified [OK]."
+    fi
+
+    # 3. Derive unique converted QCOW2 cache key tied to the source ISO SHA-256, installer settings, and build mode
+    local install_settings_hash
+    install_settings_hash=$(printf "%s:%s:%s:%s" "$act_iso_sha" "$disk_size" "$install_password" "$BUILD_MODE" | sha256sum | awk '{print $1}')
+    local cache_hash_prefix="${install_settings_hash:0:16}"
+    cached_base="${CACHE_DIR}/vyos-base-${BUILD_MODE}-${cache_hash_prefix}.qcow2"
+    local cached_base_sig="${CACHE_DIR}/.vyos-base-${BUILD_MODE}-${cache_hash_prefix}.sig"
+    local pass_hash_prefix
+    pass_hash_prefix=$(printf "%s" "$install_password" | sha256sum | awk '{print $1}')
+    local expected_sig="${act_iso_sha} size=${disk_size} mode=${BUILD_MODE} pass_sha=${pass_hash_prefix:0:16}"
+
+    # 4. Check if converted QCOW2 already exists, has valid checksum, and is healthy
+    local need_conversion=true
+    if [ -f "$cached_base" ] && [ -f "$cached_base_sig" ] && [ -f "${cached_base}.sha256" ]; then
+      local recorded_sig
+      recorded_sig=$(cat "$cached_base_sig" 2>/dev/null || true)
+      local recorded_sha
+      recorded_sha=$(cat "${cached_base}.sha256" 2>/dev/null | awk '{print $1}' || true)
+      local expected_sig_prefix="${expected_sig} qcow2_sha=${recorded_sha}"
+
+      if [ "$recorded_sig" = "$expected_sig_prefix" ] && [ -n "$recorded_sha" ]; then
+        log "Verifying cryptographic SHA-256 artifact checksum for cached VyOS base disk (${cached_base})..."
+        local actual_cached_sha
+        actual_cached_sha=$(sha256sum "$cached_base" | awk '{print $1}')
+        if [ "$actual_cached_sha" = "$recorded_sha" ]; then
+          log "Verifying structural integrity of cached converted VyOS base disk with qemu-img check..."
+          if qemu-img check -q "$cached_base" >/dev/null 2>&1; then
+            log "Found verified, cryptographically sealed VyOS base disk matching source ISO and installer settings: ${cached_base} (skipping ISO conversion)."
+            need_conversion=false
+          else
+            log "Cached converted disk failed qemu-img check. Invalidating cache and re-converting from ISO..."
+            rm -f "$cached_base" "$cached_base_sig" "${cached_base}.sha256"
+          fi
+        else
+          log "Cached converted disk SHA-256 artifact checksum mismatch (expected: ${recorded_sha:0:16}..., actual: ${actual_cached_sha:0:16}...). File was modified or corrupted. Invalidating cache and re-converting from ISO..."
+          rm -f "$cached_base" "$cached_base_sig" "${cached_base}.sha256"
+        fi
+      else
+        log "Cached converted disk installer settings or signature mismatch (ISO, disk_size, or credentials changed). Invalidating cache and re-converting from ISO..."
+        rm -f "$cached_base" "$cached_base_sig" "${cached_base}.sha256"
+      fi
+    else
+      # Clean up incomplete or partial cache metadata
+      rm -f "$cached_base_sig" "${cached_base}.sha256"
+    fi
+
+    if [ "$need_conversion" = "true" ]; then
+      log "Converting VyOS installer ISO (${cached_iso}) to bootable virtual disk (${cached_base}, size=${disk_size})..."
+      convert_vyos_iso_to_qcow2 "$cached_iso" "$cached_base" "$disk_size" "$install_password"
+
+      # Compute and seal SHA-256 artifact checksum after verified standalone boot
+      log "Computing cryptographic SHA-256 checksum for newly converted VyOS base disk..."
+      local act_base_qcow2_sha
+      act_base_qcow2_sha=$(sha256sum "$cached_base" | awk '{print $1}')
+      echo "$act_base_qcow2_sha" > "${cached_base}.sha256"
+      echo "${expected_sig} qcow2_sha=${act_base_qcow2_sha}" > "$cached_base_sig"
+      log "VyOS base QCOW2 disk generated, boot-tested, and cryptographically sealed at: ${cached_base} (SHA-256: ${act_base_qcow2_sha:0:16}...)"
+    fi
+  else
+    cached_base="${CACHE_DIR}/${base_name}"
+    if [ ! -f "$cached_base" ]; then
+      if [ -n "$base_url" ]; then
+        log "Downloading VyOS base disk from $base_url..."
+        curl --fail -L -C - -o "$cached_base" "$base_url"
+      else
+        err "VyOS base disk not found in cache ($cached_base) and no base_image.url configured in manifest."
+      fi
+    fi
+
+    # Validate base VyOS image checksum if declared
+    if [ -n "$base_sha256" ]; then
+      log "Verifying SHA-256 checksum for VyOS base disk: ${cached_base}..."
+      local act_base_sha
+      act_base_sha=$(sha256sum "$cached_base" | awk '{print $1}')
+      if [ "$act_base_sha" != "$base_sha256" ]; then
+        err "VyOS base disk SHA-256 checksum mismatch! Expected: ${base_sha256}, Got: ${act_base_sha}"
+      fi
+      log "VyOS base disk checksum verified [OK]."
+    fi
+
+    log "Validating VyOS base disk integrity with qemu-img check..."
+    if ! qemu-img check -q "$cached_base" >/dev/null 2>&1; then
+      err "VyOS base disk failed qemu-img check: ${cached_base}."
+    fi
   fi
 
   # Working staging directories for binaries and libraries
@@ -667,6 +1228,57 @@ build_vyos() {
     log "Using VyOS persistence overlay root: $root_target"
   fi
 
+  # Ensure all conf_mode and op_mode Python scripts have valid python3 shebangs and execute permissions
+  log "Ensuring valid python3 shebangs on all VyOS conf_mode and op_mode scripts..."
+  local squashfs_file
+  squashfs_file=$(ls "$mnt"/boot/*/*.squashfs 2>/dev/null | head -n 1 || true)
+  if [ -n "$squashfs_file" ] && [ -f "$squashfs_file" ]; then
+    local squash_tmp="${WORK_DIR}/squash_scripts_tmp"
+    sudo rm -rf "$squash_tmp"
+    mkdir -p "$squash_tmp"
+    unsquashfs -d "$squash_tmp" "$squashfs_file" usr/libexec/vyos/conf_mode usr/libexec/vyos/op_mode 2>/dev/null || true
+
+    for subdir in conf_mode op_mode; do
+      if [ -d "$squash_tmp/usr/libexec/vyos/$subdir" ]; then
+        sudo mkdir -p "$root_target/usr/libexec/vyos/$subdir"
+        for py_file in "$squash_tmp/usr/libexec/vyos/$subdir"/*.py; do
+          [ -f "$py_file" ] || continue
+          local bname
+          bname=$(basename "$py_file")
+          local target_file="$root_target/usr/libexec/vyos/$subdir/$bname"
+          local first_line
+          first_line=$(head -n 1 "$py_file" 2>/dev/null || echo "")
+          if [[ "$first_line" != "#!"* ]]; then
+            { echo "#!/usr/bin/env python3"; cat "$py_file"; } | sudo tee "$target_file" >/dev/null
+            sudo chmod 0755 "$target_file"
+          elif [ ! -f "$target_file" ]; then
+            sudo cp -p "$py_file" "$target_file"
+            sudo chmod 0755 "$target_file"
+          fi
+        done
+      fi
+    done
+    sudo rm -rf "$squash_tmp"
+  fi
+
+  # Also scan any scripts already present in root_target to ensure they have shebangs and execute permissions
+  for py_file in "$root_target"/usr/libexec/vyos/conf_mode/*.py "$root_target"/usr/libexec/vyos/op_mode/*.py; do
+    [ -f "$py_file" ] || continue
+    local first_line
+    first_line=$(head -n 1 "$py_file" 2>/dev/null || echo "")
+    if [[ "$first_line" != "#!"* ]]; then
+      local tmp_file
+      tmp_file=$(mktemp)
+      echo "#!/usr/bin/env python3" > "$tmp_file"
+      cat "$py_file" >> "$tmp_file"
+      sudo cp -f "$tmp_file" "$py_file"
+      sudo chmod 0755 "$py_file"
+      rm -f "$tmp_file"
+    else
+      sudo chmod 0755 "$py_file"
+    fi
+  done
+
   # Inject compiled binaries & recorded destinations
   for bin_path in "$vyos_stage_bin"/*; do
     [ -f "$bin_path" ] || continue
@@ -733,25 +1345,58 @@ build_vyos() {
     log "Injected /etc/udev/rules.d/70-persistent-net.rules from template."
   fi
 
-  # Enable serial console on ttyS0 for 'virsh console'
-  sudo mkdir -p "$root_target/etc/systemd/system/getty.target.wants"
-  sudo ln -sf /lib/systemd/system/serial-getty@.service "$root_target/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service" 2>/dev/null || true
+  # Enable serial console on ttyS0 for 'virsh console' with unblocked agetty
+  sudo mkdir -p "$root_target/etc/systemd/system/serial-getty@ttyS0.service.d"
+  cat <<'EOF_GETTY' | sudo tee "$root_target/etc/systemd/system/serial-getty@ttyS0.service.d/override.conf" >/dev/null
+[Unit]
+Description=Serial Getty on %I (VyOS / OLG Console)
+After=
+Before=
+Wants=
 
-  # Configure VyOS postconfig bootup hook to signal boot completion
+[Service]
+ExecStartPre=
+ExecStart=
+ExecStart=-/sbin/agetty --noclear --keep-baud 115200,38400,9600 %I $TERM
+Restart=always
+RestartSec=1s
+EOF_GETTY
+  sudo chmod 0644 "$root_target/etc/systemd/system/serial-getty@ttyS0.service.d/override.conf"
+
+  sudo mkdir -p "$root_target/etc/systemd/system/getty.target.wants" "$root_target/etc/systemd/system/multi-user.target.wants"
+  sudo ln -sf /lib/systemd/system/serial-getty@.service "$root_target/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service" 2>/dev/null || true
+  sudo ln -sf /lib/systemd/system/serial-getty@.service "$root_target/etc/systemd/system/multi-user.target.wants/serial-getty@ttyS0.service" 2>/dev/null || true
+
+  # Configure VyOS postconfig bootup hook to signal boot completion and ensure core runtime services
+  local seen_scripts=()
   for POSTCONFIG_DIR in "$root_target/opt/vyatta/etc/config/scripts" "$root_target/config/scripts"; do
-    sudo mkdir -p "$POSTCONFIG_DIR"
-    POSTCONFIG_SCRIPT="$POSTCONFIG_DIR/vyos-postconfig-bootup.script"
-    if [ ! -f "$POSTCONFIG_SCRIPT" ]; then
-      echo '#!/bin/sh' | sudo tee "$POSTCONFIG_SCRIPT" >/dev/null
+    [ -d "$POSTCONFIG_DIR" ] || sudo mkdir -p "$POSTCONFIG_DIR"
+    local real_dir
+    real_dir=$(readlink -f "$POSTCONFIG_DIR" 2>/dev/null || echo "$POSTCONFIG_DIR")
+    if [[ " ${seen_scripts[*]} " =~ " ${real_dir} " ]]; then
+      continue
     fi
-    cat <<'EOF_POSTCONFIG' | sudo tee -a "$POSTCONFIG_SCRIPT" >/dev/null
+    seen_scripts+=("$real_dir")
+
+    POSTCONFIG_SCRIPT="$POSTCONFIG_DIR/vyos-postconfig-bootup.script"
+    local olg_block
+    olg_block=$(cat <<'EOF_POSTCONFIG'
+### BEGIN OLG MANAGED BLOCK ###
+# OLG: Ensure kernel modules are loaded
+modprobe virtiofs 2>/dev/null || true
+modprobe virtio_pci 2>/dev/null || true
+modprobe binfmt_misc 2>/dev/null || true
+systemctl restart systemd-binfmt 2>/dev/null || true
 
 # OLG: Ensure runtime directories exist
-mkdir -p /run/vyatta/config /run/vyos 2>/dev/null || true
+mkdir -p /run/vyatta/config /run/vyos /etc/olg/secrets /etc/olg/device-certs /opt/olg/state 2>/dev/null || true
 
 # OLG: Ensure management interface mgmt0 is configured and up
 ip addr add 192.168.254.1/24 dev mgmt0 2>/dev/null || true
 ip link set mgmt0 up 2>/dev/null || true
+
+# OLG: Ensure serial-getty is active on ttyS0 for virsh console
+systemctl restart serial-getty@ttyS0.service 2>/dev/null || true
 
 # OLG: Ensure DNS nameservers for domain resolution out of the box
 which resolvectl >/dev/null 2>&1 && resolvectl default-route br0 true 2>/dev/null || true
@@ -766,10 +1411,41 @@ for cfg in /config/config.boot /opt/vyatta/etc/config/config.boot; do
   [ -f "$cfg" ] && sed -i '/^[[:space:]]*hw-id[[:space:]]/d' "$cfg" 2>/dev/null || true
 done
 
+# OLG: Ensure Kea DHCP daemon rebinds raw sockets to active bridge interfaces
+systemctl is-active isc-kea-dhcp4-server >/dev/null 2>&1 && systemctl restart isc-kea-dhcp4-server 2>/dev/null || true
+
 # OLG: Signal that VyOS postconfig and initial boot commits are 100% complete
 touch /run/vyos/boot_ready
+### END OLG MANAGED BLOCK ###
 EOF_POSTCONFIG
+)
+
+    if [ -f "$POSTCONFIG_SCRIPT" ] && [ -s "$POSTCONFIG_SCRIPT" ]; then
+      # Strip previous OLG managed block if present to ensure idempotency while preserving user scripts
+      sudo sed -i '/### BEGIN OLG MANAGED BLOCK ###/,/### END OLG MANAGED BLOCK ###/d' "$POSTCONFIG_SCRIPT" 2>/dev/null || true
+      if [ -n "$(sudo tail -c 1 "$POSTCONFIG_SCRIPT" 2>/dev/null || true)" ]; then
+        echo "" | sudo tee -a "$POSTCONFIG_SCRIPT" >/dev/null
+      fi
+      echo "$olg_block" | sudo tee -a "$POSTCONFIG_SCRIPT" >/dev/null
+    else
+      {
+        echo "#!/bin/sh"
+        echo "set -e"
+        echo ""
+        echo "$olg_block"
+      } | sudo tee "$POSTCONFIG_SCRIPT" >/dev/null
+    fi
     sudo chmod 0755 "$POSTCONFIG_SCRIPT"
+
+    # Install commit post-hook to rebind Kea DHCP raw sockets after configuration commits
+    local commit_post_dir="$POSTCONFIG_DIR/commit/post-hooks.d"
+    sudo mkdir -p "$commit_post_dir"
+    cat <<'EOF_KEA_HOOK' | sudo tee "$commit_post_dir/10-restart-kea" >/dev/null
+#!/bin/sh
+# OLG: Rebind Kea DHCP raw sockets after configuration commits
+systemctl is-active isc-kea-dhcp4-server >/dev/null 2>&1 && systemctl restart isc-kea-dhcp4-server 2>/dev/null || true
+EOF_KEA_HOOK
+    sudo chmod 0755 "$commit_post_dir/10-restart-kea"
   done
 
   # Configure VirtIO-FS auto-mount in /etc/fstab and modules
@@ -790,9 +1466,21 @@ EOF_POSTCONFIG
     [ -n "$f" ] && cfg_boot_files+=("$f")
   done < <(sudo find "$mnt" -type f -name "config.boot" 2>/dev/null || true)
 
+  if [ "${#cfg_boot_files[@]}" -eq 0 ]; then
+    err "Required VyOS configuration file 'config.boot' not found in $mnt!"
+  fi
+
   for CFG_BOOT in "${cfg_boot_files[@]}"; do
     [ -f "$CFG_BOOT" ] || continue
     log "Sanitizing and prepping VyOS config: $CFG_BOOT..."
+    # Update VyOS administrative user credentials in config.boot (strictly scoped to user vyos)
+    if [ -n "$admin_password" ]; then
+      local pass_hash
+      pass_hash=$(openssl passwd -6 "$admin_password")
+      if ! update_vyos_config_boot_password "$CFG_BOOT" "$pass_hash"; then
+        err "Failed to update encrypted-password for user 'vyos' in $CFG_BOOT"
+      fi
+    fi
     # Strip stale hardware MAC IDs and any old ethernet interface definitions
     sudo sed -i '/^[[:space:]]*hw-id[[:space:]]/d' "$CFG_BOOT" 2>/dev/null || true
     sudo awk '
@@ -819,6 +1507,30 @@ EOF_POSTCONFIG
       sudo sed -i '/system {/a \    name-server 1.1.1.1\n    name-server 8.8.8.8' "$CFG_BOOT" 2>/dev/null || true
     fi
   done
+
+  # Configure /etc/shadow user credentials
+  local shadow_files=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && shadow_files+=("$f")
+  done < <(sudo find "$mnt" -type f -name "shadow" 2>/dev/null || true)
+
+  if [ "${#shadow_files[@]}" -eq 0 ]; then
+    err "Required user credentials database '/etc/shadow' not found in $mnt!"
+  fi
+
+  if [ -n "$admin_password" ]; then
+    local shadow_hash
+    shadow_hash=$(openssl passwd -6 "$admin_password")
+    for shf in "${shadow_files[@]}"; do
+      if ! sudo grep -q "^vyos:" "$shf" 2>/dev/null; then
+        err "Required administrative user 'vyos' missing from shadow file: $shf"
+      fi
+      sudo sed -i -E "s|^vyos:[^:]+:|vyos:${shadow_hash}:|" "$shf"
+      if ! sudo grep -q "^vyos:${shadow_hash}:" "$shf" 2>/dev/null; then
+        err "Failed to write password hash for user 'vyos' in $shf"
+      fi
+    done
+  fi
 
   # Inject custom VyOS files declared in manifest (local_path or url)
   local num_vfiles
@@ -866,16 +1578,316 @@ EOF_POSTCONFIG
     done
   fi
 
+  # In production mode: Verify configured credentials match admin_password and no default credentials remain
+  if [ "$BUILD_MODE" = "production" ]; then
+    log "Running production security verification: Asserting configured admin_password matches stored hashes and default credentials are absent..."
+    for shf in "${shadow_files[@]}"; do
+      local vyos_entry
+      vyos_entry=$(sudo grep "^vyos:" "$shf" 2>/dev/null || true)
+      if [ -z "$vyos_entry" ]; then
+        err "Security Validation FAILED: Administrative user 'vyos' missing from $shf!"
+      fi
+      local vyos_hash
+      vyos_hash=$(echo "$vyos_entry" | cut -d: -f2)
+      if [ "$vyos_hash" = "!" ] || [ "$vyos_hash" = "*" ] || [ -z "$vyos_hash" ]; then
+        err "Security Validation FAILED: Production image vyos user is locked ($vyos_hash) and will block console/RTTY access!"
+      fi
+
+      local salt
+      salt=$(echo "$vyos_hash" | cut -d'$' -f3)
+      if [ -z "$salt" ]; then
+        err "Security Validation FAILED: Unable to extract SHA-512 salt from $shf hash!"
+      fi
+
+      local expected_hash
+      expected_hash=$(openssl passwd -6 -salt "$salt" "$admin_password" 2>/dev/null || true)
+      if [ "$vyos_hash" != "$expected_hash" ]; then
+        err "Security Validation FAILED: Stored shadow hash in $shf does not match configured admin_password!"
+      fi
+
+      local test_default_hash
+      test_default_hash=$(openssl passwd -6 -salt "$salt" "vyos" 2>/dev/null || true)
+      if [ "$vyos_hash" = "$test_default_hash" ]; then
+        err "Security Validation FAILED: Production image contains default password 'vyos' in $shf!"
+      fi
+    done
+
+    for CFG_BOOT in "${cfg_boot_files[@]}"; do
+      local boot_hash
+      if ! boot_hash=$(extract_vyos_config_boot_password "$CFG_BOOT"); then
+        err "Security Validation FAILED: Unable to extract encrypted-password for user 'vyos' from $CFG_BOOT!"
+      fi
+      local bsalt
+      bsalt=$(echo "$boot_hash" | cut -d'$' -f3)
+      if [ -z "$bsalt" ]; then
+        err "Security Validation FAILED: Unable to extract SHA-512 salt from $CFG_BOOT user 'vyos' hash!"
+      fi
+
+      local expected_boot_hash
+      expected_boot_hash=$(openssl passwd -6 -salt "$bsalt" "$admin_password" 2>/dev/null || true)
+      if [ "$boot_hash" != "$expected_boot_hash" ]; then
+        err "Security Validation FAILED: Stored config.boot hash for user 'vyos' in $CFG_BOOT does not match configured admin_password!"
+      fi
+
+      local test_boot_default
+      test_boot_default=$(openssl passwd -6 -salt "$bsalt" "vyos" 2>/dev/null || true)
+      if [ "$boot_hash" = "$test_boot_default" ]; then
+        err "Security Validation FAILED: Production image config.boot user 'vyos' contains default password hash for 'vyos'!"
+      fi
+    done
+    log "Production security verification PASSED: Verified admin_password matches stored hashes and default credentials are absent."
+  fi
+
+  # Verify Kea DHCP postconfig and post-hook presence
+  local found_kea_postconfig=false
+  local found_kea_hook=false
+  for POSTCONFIG_DIR in "$root_target/opt/vyatta/etc/config/scripts" "$root_target/config/scripts"; do
+    if [ -f "$POSTCONFIG_DIR/vyos-postconfig-bootup.script" ] && grep -q "isc-kea-dhcp4-server" "$POSTCONFIG_DIR/vyos-postconfig-bootup.script" 2>/dev/null; then
+      found_kea_postconfig=true
+    fi
+    if [ -x "$POSTCONFIG_DIR/commit/post-hooks.d/10-restart-kea" ]; then
+      found_kea_hook=true
+    fi
+  done
+  if [ "$found_kea_postconfig" = false ] || [ "$found_kea_hook" = false ]; then
+    err "Validation FAILED: Kea DHCP raw socket rebind hooks missing from customized VyOS filesystem."
+  fi
+  log "Kea DHCP raw socket rebind hooks validated successfully."
+
   # Unmount NBD and cleanly disconnect
   sudo umount "$mnt"
   VYOS_MNT_DIR=""
   sudo qemu-nbd --disconnect "$CURRENT_NBD_DEV" 2>/dev/null || true
   CURRENT_NBD_DEV=""
 
-  # Generate Checksum
-  (cd "$OUTPUT_DIR" && sha256sum "$(basename "$golden_disk")" > "${golden_disk}.sha256")
+  # Generate Checksum and Attestation Manifest
+  local act_golden_sha
+  act_golden_sha=$(sha256sum "$golden_disk" | awk '{print $1}')
+  echo "$act_golden_sha  $(basename "$golden_disk")" > "${golden_disk}.sha256"
+
+  local pass_sha=""
+  [ -n "$admin_password" ] && pass_sha=$(printf "%s" "$admin_password" | sha256sum | awk '{print $1}')
+  local timestamp
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local attestation_file="${golden_disk}.attestation.json"
+  jq -n \
+    --arg artifact "$(basename "$golden_disk")" \
+    --arg build_mode "$BUILD_MODE" \
+    --arg qcow2_sha256 "$act_golden_sha" \
+    --arg pass_sha256 "$pass_sha" \
+    --arg built_at "$timestamp" \
+    --arg source_iso "$(basename "${cached_iso:-unknown.iso}")" \
+    --arg source_iso_sha256 "${act_iso_sha:-unknown}" \
+    --argjson credentials_verified true \
+    '{
+      artifact: $artifact,
+      build_mode: $build_mode,
+      qcow2_sha256: $qcow2_sha256,
+      admin_password_hash_sha256: $pass_sha256,
+      built_at: $built_at,
+      source_iso: $source_iso,
+      source_iso_sha256: $source_iso_sha256,
+      credentials_verified: $credentials_verified
+    }' > "$attestation_file"
+  log "Generated cryptographic image attestation at: ${attestation_file}"
   log "VyOS Golden Master Disk built successfully at: ${golden_disk}"
-  generate_provenance_manifest "${OUTPUT_DIR}/provenance.json"
+  generate_provenance_manifest "${OUTPUT_DIR}/image_details.json"
+}
+
+# ==============================================================================
+# Helper: Verify VyOS Golden Master Attestation & In-Guest Credentials Gate
+# Guarantees that images packaged into ISOs (including --iso-only) are attested,
+# match the target build mode, and have zero default credentials.
+# ==============================================================================
+verify_golden_image_attestation_and_credentials() {
+  local disk="$1"
+  local expected_mode="$2"
+  local expected_pass="$3"
+  local attestation_file="${disk}.attestation.json"
+  local sha_file="${disk}.sha256"
+
+  log "Verifying golden master image attestation and credentials for mode '${expected_mode}'..."
+
+  # 1. Existence checks
+  if [ ! -f "$disk" ]; then
+    err "Cannot build ISO: Golden master image missing at ${disk}. Run without --iso-only first."
+  fi
+  if [ ! -f "$sha_file" ]; then
+    err "Production security violation: Golden master checksum manifest missing at ${sha_file}."
+  fi
+  if [ ! -f "$attestation_file" ]; then
+    err "Production security violation: Golden master image attestation missing at ${attestation_file}. Image was not verified by build_vyos. Rebuild with full pipeline."
+  fi
+
+  # 2. Disk SHA-256 integrity check against .sha256 manifest
+  local actual_sha
+  actual_sha=$(sha256sum "$disk" | awk '{print $1}')
+  local recorded_sha
+  recorded_sha=$(cat "$sha_file" 2>/dev/null | awk '{print $1}' || true)
+  if [ -z "$recorded_sha" ] || [ "$actual_sha" != "$recorded_sha" ]; then
+    err "Production security violation: Golden master disk checksum mismatch against ${sha_file}! (expected: ${recorded_sha}, actual: ${actual_sha})"
+  fi
+
+  # 3. Attestation content and integrity validation
+  local att_artifact att_mode att_sha att_pass_sha att_verified
+  att_artifact=$(jq -r '.artifact // empty' "$attestation_file" 2>/dev/null || true)
+  att_mode=$(jq -r '.build_mode // empty' "$attestation_file" 2>/dev/null || true)
+  att_sha=$(jq -r '.qcow2_sha256 // empty' "$attestation_file" 2>/dev/null || true)
+  att_pass_sha=$(jq -r '.admin_password_hash_sha256 // empty' "$attestation_file" 2>/dev/null || true)
+  att_verified=$(jq -r '.credentials_verified // false' "$attestation_file" 2>/dev/null || true)
+
+  if [ -z "$att_mode" ] || [ -z "$att_sha" ]; then
+    err "Production security violation: Corrupted or unreadable image attestation in ${attestation_file}."
+  fi
+
+  if [ "$actual_sha" != "$att_sha" ]; then
+    err "Production security violation: Image attestation SHA-256 mismatch! Attestation records ${att_sha}, but disk is ${actual_sha}."
+  fi
+
+  if [ "$att_verified" != "true" ]; then
+    err "Production security violation: Image attestation indicates credentials were NOT verified at build time."
+  fi
+
+  # 4. Mode gate: Reject development image when building in production mode
+  if [ "$expected_mode" = "production" ]; then
+    if [ "$att_mode" != "production" ]; then
+      err "Production security violation: Golden master image was built in '${att_mode}' mode (contains default 'vyos' development credentials). Cannot package a development image into a production ISO! Rebuild VyOS disk with --production."
+    fi
+
+    # Stale credential check against current manifest
+    if [ -n "$expected_pass" ]; then
+      local exp_pass_sha
+      exp_pass_sha=$(printf "%s" "$expected_pass" | sha256sum | awk '{print $1}')
+      if [ -n "$att_pass_sha" ] && [ "$att_pass_sha" != "$exp_pass_sha" ]; then
+        err "Production security violation: Golden master image was built with a different admin_password than currently configured in build.yaml. Rebuild VyOS disk with --production."
+      fi
+    fi
+
+    # 5. Direct In-Guest Credential Gate: Inspect disk via read-only NBD to verify zero default credentials
+    log "Performing direct in-guest credential audit on ${disk} before ISO packaging..."
+    local check_mnt="${WORK_DIR}/attest_mnt"
+    mkdir -p "$check_mnt"
+
+    local nbd_dev
+    nbd_dev=$(find_free_nbd 2>/dev/null || true)
+    if [ -z "$nbd_dev" ]; then
+      err "No free NBD block device available for credential audit."
+    fi
+
+    CURRENT_NBD_DEV="$nbd_dev"
+    sudo qemu-nbd --disconnect "$nbd_dev" 2>/dev/null || true
+    sudo qemu-nbd --read-only --connect="$nbd_dev" "$disk"
+    sleep 1
+
+    local part_dev="${nbd_dev}p3"
+    if [ ! -b "$part_dev" ]; then
+      sudo partx -u "$nbd_dev" 2>/dev/null || sudo partprobe "$nbd_dev" 2>/dev/null || true
+      sleep 1
+    fi
+    if [ ! -b "$part_dev" ]; then
+      sudo qemu-nbd --disconnect "$nbd_dev" 2>/dev/null || true
+      CURRENT_NBD_DEV=""
+      err "Failed to access root partition ${part_dev} on ${disk} for credential audit."
+    fi
+
+    VYOS_MNT_DIR="$check_mnt"
+    sudo mount -o ro "$part_dev" "$check_mnt"
+
+    local audit_failed=false
+    local audit_reason=""
+
+    # Audit shadow files
+    local shadow_files=()
+    while IFS= read -r f; do
+      [ -n "$f" ] && shadow_files+=("$f")
+    done < <(sudo find "$check_mnt" -type f -name "shadow" 2>/dev/null || true)
+
+    if [ "${#shadow_files[@]}" -eq 0 ]; then
+      audit_failed=true; audit_reason="Required /etc/shadow not found on root partition"
+    fi
+
+    for shf in "${shadow_files[@]}"; do
+      local vyos_entry
+      vyos_entry=$(sudo grep "^vyos:" "$shf" 2>/dev/null || true)
+      if [ -z "$vyos_entry" ]; then
+        audit_failed=true; audit_reason="vyos user missing in $shf"; break
+      fi
+      local vhash
+      vhash=$(echo "$vyos_entry" | cut -d: -f2)
+      if [ "$vhash" = "!" ] || [ "$vhash" = "*" ] || [ -z "$vhash" ]; then
+        audit_failed=true; audit_reason="vyos user is locked ($vhash) in $shf"; break
+      fi
+      local vsalt
+      vsalt=$(echo "$vhash" | cut -d'$' -f3)
+      if [ -z "$vsalt" ]; then
+        audit_failed=true; audit_reason="Unable to extract salt from $shf"; break
+      fi
+      local def_h
+      def_h=$(openssl passwd -6 -salt "$vsalt" "vyos" 2>/dev/null || true)
+      if [ "$vhash" = "$def_h" ]; then
+        audit_failed=true; audit_reason="Default password 'vyos' found in $shf"; break
+      fi
+      if [ -n "$expected_pass" ]; then
+        local exp_h
+        exp_h=$(openssl passwd -6 -salt "$vsalt" "$expected_pass" 2>/dev/null || true)
+        if [ "$vhash" != "$exp_h" ]; then
+          audit_failed=true; audit_reason="Stored hash in $shf does not match expected admin_password"; break
+        fi
+      fi
+    done
+
+    # Audit config.boot files
+    if [ "$audit_failed" = false ]; then
+      local boot_files=()
+      while IFS= read -r f; do
+        [ -n "$f" ] && boot_files+=("$f")
+      done < <(sudo find "$check_mnt" -type f -name "config.boot" 2>/dev/null || true)
+
+      if [ "${#boot_files[@]}" -eq 0 ]; then
+        audit_failed=true; audit_reason="Required config.boot not found on root partition"
+      fi
+
+      for cboot in "${boot_files[@]}"; do
+        local b_hash
+        if ! b_hash=$(extract_vyos_config_boot_password "$cboot" 2>/dev/null); then
+          audit_failed=true; audit_reason="Failed to extract 'system login user vyos' encrypted-password from $cboot"; break
+        fi
+        local b_salt
+        b_salt=$(echo "$b_hash" | cut -d'$' -f3)
+        if [ -z "$b_salt" ]; then
+          audit_failed=true; audit_reason="Unable to extract salt from $cboot user 'vyos' hash"; break
+        fi
+        local b_def_h
+        b_def_h=$(openssl passwd -6 -salt "$b_salt" "vyos" 2>/dev/null || true)
+        if [ "$b_hash" = "$b_def_h" ]; then
+          audit_failed=true; audit_reason="Default password hash for 'vyos' found in $cboot user 'vyos'"; break
+        fi
+        if [ -n "$expected_pass" ]; then
+          local b_exp_h
+          b_exp_h=$(openssl passwd -6 -salt "$b_salt" "$expected_pass" 2>/dev/null || true)
+          if [ "$b_hash" != "$b_exp_h" ]; then
+            audit_failed=true; audit_reason="Stored hash for user 'vyos' in $cboot does not match expected admin_password"; break
+          fi
+        fi
+      done
+    fi
+
+    # Unmount and disconnect NBD
+    sudo umount "$check_mnt" 2>/dev/null || true
+    VYOS_MNT_DIR=""
+    sudo qemu-nbd --disconnect "$nbd_dev" 2>/dev/null || true
+    CURRENT_NBD_DEV=""
+    rmdir "$check_mnt" 2>/dev/null || true
+
+    if [ "$audit_failed" = true ]; then
+      err "Production security violation: Direct in-guest credential audit FAILED: ${audit_reason}! Cannot package unverified image into production ISO."
+    fi
+
+    log "Direct in-guest credential audit PASSED: Verified zero default credentials and authentic production hashes [OK]."
+  fi
+
+  log "Golden master image attestation verified successfully: Artifact is authentic, matches build mode '${expected_mode}', and is sealed [OK]."
 }
 
 # ==============================================================================
@@ -894,6 +1906,20 @@ build_iso() {
   if [ ! -f "$golden_disk" ]; then
     err "Cannot build ISO: ${golden_disk} is missing. Run without --iso-only first."
   fi
+
+  local vyos_json
+  vyos_json=$(jq -c '.vyos' <<< "$MANIFEST_JSON")
+  local admin_password
+  admin_password=$(jq -r '.base_image.admin_password // .admin_password // empty' <<< "$vyos_json")
+
+  if [ "$BUILD_MODE" = "production" ]; then
+    if [ -z "$admin_password" ] || [ "$admin_password" = "vyos" ]; then
+      err "Production build security policy violation: Reusable default credentials ('vyos') or empty passwords are prohibited. Please specify a secure custom admin_password in build.yaml (or build with --dev for local testing)."
+    fi
+  fi
+
+  # Require verified production-mode image attestation and credential audit before packaging
+  verify_golden_image_attestation_and_credentials "$golden_disk" "$BUILD_MODE" "$admin_password"
 
   local base_iso="${CACHE_DIR}/ubuntu-${UBUNTU_RELEASE}-live-server-amd64.iso"
   [ ! -f "$base_iso" ] && [ -f "${BUILD_DIR}/iso/cache/ubuntu-${UBUNTU_RELEASE}-live-server-amd64.iso" ] && base_iso="${BUILD_DIR}/iso/cache/ubuntu-${UBUNTU_RELEASE}-live-server-amd64.iso"
@@ -1045,23 +2071,23 @@ build_iso() {
   else
     # Fallback default: Compile native host bootstrap tools if not explicitly in manifest
     log "Compiling default native Go bootstrap binaries..."
-    (cd "$SCRIPT_DIR/tools" && CGO_ENABLED=0 go build -o "$payload_dir/tools/nats_pki_bootstrap" nats_pki_bootstrap.go)
-    (cd "$SCRIPT_DIR/tools" && CGO_ENABLED=0 go build -o "$payload_dir/tools/nats_kv_pusher" nats_kv_pusher.go)
+    (cd "$SCRIPT_DIR/tools" && CGO_ENABLED=0 go build -o "$payload_dir/tools/pki_init" pki_init.go)
+    (cd "$SCRIPT_DIR/tools" && CGO_ENABLED=0 go build -o "$payload_dir/tools/kv_config_init" kv_config_init.go)
     mkdir -p "${PROVENANCE_DIR}"
     jq -n \
-      --arg name "nats_pki_bootstrap" \
+      --arg name "pki_init" \
       --arg type "go" \
       --arg repo "local" \
       --arg commit "local" \
-      --arg dest "tools/nats_pki_bootstrap" \
+      --arg dest "tools/pki_init" \
       '{name: $name, type: $type, repo: $repo, ref: "local", commit_sha: $commit, dest: $dest}' \
       > "${PROVENANCE_DIR}/host_bin_0.json"
     jq -n \
-      --arg name "nats_kv_pusher" \
+      --arg name "kv_config_init" \
       --arg type "go" \
       --arg repo "local" \
       --arg commit "local" \
-      --arg dest "tools/nats_kv_pusher" \
+      --arg dest "tools/kv_config_init" \
       '{name: $name, type: $type, repo: $repo, ref: "local", commit_sha: $commit, dest: $dest}' \
       > "${PROVENANCE_DIR}/host_bin_1.json"
   fi
@@ -1070,6 +2096,7 @@ build_iso() {
   log "Bundling VyOS Golden Disk into ISO payload..."
   cp "$golden_disk" "$payload_dir/images/vyos-golden.qcow2"
   cp "${golden_disk}.sha256" "$payload_dir/images/vyos-golden.qcow2.sha256"
+  [ -f "${golden_disk}.attestation.json" ] && cp "${golden_disk}.attestation.json" "$payload_dir/images/vyos-golden.qcow2.attestation.json"
 
   # Process Host Containers from manifest
   local host_json
@@ -1495,9 +2522,9 @@ EOF_PERM
   fi
   log "Extracted EFI boot image validated successfully (${actual_bytes} bytes, FAT filesystem, verified UEFI bootloader) [OK]."
 
-  # Generate artifact provenance manifest and embed into appliance payload
-  log "Generating artifact provenance manifest..."
-  generate_provenance_manifest "${payload_dir}/config/provenance.json"
+  # Generate artifact image details manifest and embed into appliance payload
+  log "Generating artifact image details manifest..."
+  generate_provenance_manifest "${payload_dir}/config/image_details.json"
 
   # Package final hybrid ISO using discovered metadata
   local final_iso="${OUTPUT_DIR}/olg-enterprise-appliance-${UBUNTU_RELEASE}.iso"
@@ -1539,7 +2566,7 @@ EOF_PERM
   "${xorriso_cmd[@]}"
 
   (cd "$OUTPUT_DIR" && sha256sum "$(basename "$final_iso")" > "${final_iso}.sha256")
-  generate_provenance_manifest "${OUTPUT_DIR}/provenance.json" "$final_iso"
+  generate_provenance_manifest "${OUTPUT_DIR}/image_details.json" "$final_iso"
   log "Enterprise Appliance ISO created successfully at: ${final_iso}"
 }
 

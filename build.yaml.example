@@ -5,15 +5,28 @@
 
 version: "1.0"
 
+# Firmware build mode: 'production' (default: secure-by-default, locks default credentials)
+# or 'dev' (enables default development credentials 'vyos' for local lab testing).
+# Can be overridden via CLI flags '--dev' or '--production'.
+build_mode: "production"
+
 # ------------------------------------------------------------------------------
 # VyOS Router VM Components
 # Each binary is built (with optional patches) and injected into vyos-golden.qcow2
 # ------------------------------------------------------------------------------
 vyos:
   base_image:
-    cache_name: "vyos-base.qcow2"
-    url: "" # Optional fallback URL if vyos-base.qcow2 is missing from build/cache/
-    sha256: "" # Optional expected SHA-256 checksum for source image verification
+    # Supply either a pre-installed VyOS QCOW2 (e.g. "vyos-base.qcow2")
+    # OR an official VyOS installer ISO (e.g. "vyos-rolling-amd64.iso").
+    # When an ISO is provided, build.sh automatically installs VyOS into a bootable QCOW2.
+    cache_name: "vyos-2026.03-generic-amd64.iso"
+    url: "https://community-downloads.vyos.dev/stream/2026.03/vyos-2026.03-generic-amd64.iso"
+    sha256: "56151a536e4a70c1a3f9202d8e6e59e7dd308cc84e2c50b633884a1376a39010" # SHA-256 checksum for source image verification
+    disk_size: "10G" # Virtual disk capacity (Default: "10G")
+    # Administrative password for user 'vyos'. In 'production' mode, a secure custom password
+    # must be provided here in build.yaml (the default 'vyos' is rejected).
+    # In 'dev' mode, defaults to 'vyos' if omitted. Left empty by default to prevent hardcoded credentials.
+    admin_password: ""
 
   binaries:
     - name: vyos-nats-agent
@@ -43,23 +56,23 @@ vyos:
 # Binaries, containers and packages packaged into the air-gapped Ubuntu installer ISO
 # ------------------------------------------------------------------------------
 host:
-  ubuntu_release: "25.10"
-  ubuntu_iso_url: "https://releases.ubuntu.com/25.10/ubuntu-25.10-live-server-amd64.iso"
-  ubuntu_iso_sha256: "" # Optional expected SHA-256 checksum for base Ubuntu installer ISO
+  ubuntu_release: "26.04"
+  ubuntu_iso_url: "https://releases.ubuntu.com/26.04/ubuntu-26.04.1-live-server-amd64.iso"
+  ubuntu_iso_sha256: "cc8a95cde20f6ced61a322420de00f10cc3c90ced545daa46cb9c1a117f1d927" # Optional expected SHA-256 checksum for base Ubuntu installer ISO
   hardware_profile: "config/hardware-profiles/acer-aspire-gateway.json"
 
   binaries:
-    - name: nats_pki_bootstrap
+    - name: pki_init
       type: go
-      local_path: "tools/nats_pki_bootstrap.go"
-      dest: "tools/nats_pki_bootstrap"
-      build_cmd: "CGO_ENABLED=0 go build -ldflags='-w -s' -o {output} nats_pki_bootstrap.go"
+      local_path: "tools/pki_init.go"
+      dest: "tools/pki_init"
+      build_cmd: "CGO_ENABLED=0 go build -ldflags='-w -s' -o {output} pki_init.go"
 
-    - name: nats_kv_pusher
+    - name: kv_config_init
       type: go
-      local_path: "tools/nats_kv_pusher.go"
-      dest: "tools/nats_kv_pusher"
-      build_cmd: "CGO_ENABLED=0 go build -ldflags='-w -s' -o {output} nats_kv_pusher.go"
+      local_path: "tools/kv_config_init.go"
+      dest: "tools/kv_config_init"
+      build_cmd: "CGO_ENABLED=0 go build -ldflags='-w -s' -o {output} kv_config_init.go"
 
   containers:
     - name: ucentral-client
@@ -105,6 +118,7 @@ host:
 
   offline_packages:
     - qemu-system-x86
+    - qemu-utils
     - libvirt-daemon-system
     - libvirt-clients
     - virtiofsd

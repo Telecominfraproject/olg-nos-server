@@ -11,6 +11,27 @@ mkdir -p "$(dirname "$INSTALL_LOG")"
 echo "=== [$(date -u)] Starting OLG Enterprise Appliance Post-Install Provisioning ===" > "$INSTALL_LOG"
 ln -sf olg-install.log /target/var/log/olg-package-install.log 2>/dev/null || true
 
+# 0. Ensure kernel virtual filesystems (/dev, /proc, /sys, /run) are bind-mounted into /target for chroot operations
+MOUNTED_FS=()
+for fs in /dev /dev/pts /proc /sys /run; do
+  if [ -d "$fs" ] && ! mountpoint -q "/target$fs"; then
+    mkdir -p "/target$fs"
+    mount --bind "$fs" "/target$fs"
+    MOUNTED_FS+=("/target$fs")
+  fi
+done
+
+cleanup_mounts() {
+  rm -f /target/usr/sbin/policy-rc.d 2>/dev/null || true
+  for ((idx=${#MOUNTED_FS[@]}-1; idx>=0; idx--)); do
+    local m="${MOUNTED_FS[idx]}"
+    if mountpoint -q "$m"; then
+      umount -l "$m" 2>/dev/null || true
+    fi
+  done
+}
+trap cleanup_mounts EXIT
+
 # 1. Update kernel command line parameters in GRUB
 sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=on amd_iommu=on iommu=pt kvm.ignore_msrs=1 console=tty0 console=ttyS0,115200n8"/' /target/etc/default/grub 2>/dev/null || true
 sed -i 's/GRUB_TIMEOUT=.*/GRUB_TIMEOUT=2/' /target/etc/default/grub 2>/dev/null || true
@@ -32,8 +53,8 @@ if ! cp -a /cdrom/olg-payload/* /target/opt/olg/ >> "$INSTALL_LOG" 2>&1; then
   exit 1
 fi
 chmod 0755 /target/opt/olg/scripts/startup_node.sh 2>/dev/null || true
-[ -f /target/opt/olg/tools/nats_pki_bootstrap ] && chmod 0755 /target/opt/olg/tools/nats_pki_bootstrap 2>/dev/null || true
-[ -f /target/opt/olg/tools/nats_kv_pusher ] && chmod 0755 /target/opt/olg/tools/nats_kv_pusher 2>/dev/null || true
+[ -f /target/opt/olg/tools/pki_init ] && chmod 0755 /target/opt/olg/tools/pki_init 2>/dev/null || true
+[ -f /target/opt/olg/tools/kv_config_init ] && chmod 0755 /target/opt/olg/tools/kv_config_init 2>/dev/null || true
 
 # 4.5. Install custom files declared in manifest onto the root filesystem
 if [ -d /cdrom/olg-payload/custom-files/root ]; then
@@ -70,12 +91,12 @@ if [ -f /target/opt/olg/config/ucentral_client_template.json ]; then
   chmod 0600 /target/etc/olg/client/config.json
 fi
 
-# Install artifact provenance manifest into /etc/olg/provenance.json
-if [ -f /target/opt/olg/config/provenance.json ]; then
-  if ! cp -f /target/opt/olg/config/provenance.json /target/etc/olg/provenance.json >> "$INSTALL_LOG" 2>&1; then
-    echo "WARNING: Failed to copy provenance manifest to /etc/olg/provenance.json" >> "$INSTALL_LOG"
+# Install artifact image details manifest into /etc/olg/image_details.json
+if [ -f /target/opt/olg/config/image_details.json ]; then
+  if ! cp -f /target/opt/olg/config/image_details.json /target/etc/olg/image_details.json >> "$INSTALL_LOG" 2>&1; then
+    echo "WARNING: Failed to copy image details manifest to /etc/olg/image_details.json" >> "$INSTALL_LOG"
   else
-    chmod 0644 /target/etc/olg/provenance.json
+    chmod 0644 /target/etc/olg/image_details.json
   fi
 fi
 
@@ -92,6 +113,10 @@ if [ -f /target/opt/olg/debs/Packages.gz ]; then
     [ -f "$src" ] && mv -f "$src" /target/etc/apt/sources.list.d/bak_offline/ 2>/dev/null || true
   done
 
+  # Prevent background daemons from starting inside chroot during package install
+  echo -e '#!/bin/sh\nexit 101' > /target/usr/sbin/policy-rc.d 2>/dev/null || true
+  chmod +x /target/usr/sbin/policy-rc.d 2>/dev/null || true
+
   echo "deb [trusted=yes] file:/opt/olg/debs ./" > /target/etc/apt/sources.list.d/olg-offline.list
 
   echo "Updating local APT repository cache..." >> "$INSTALL_LOG"
@@ -102,11 +127,14 @@ if [ -f /target/opt/olg/debs/Packages.gz ]; then
 
   echo "Installing offline dependencies via APT solver..." >> "$INSTALL_LOG"
   if ! chroot /target bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    qemu-system-x86 libvirt-daemon-system libvirt-clients virtiofsd \
+    qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients virtiofsd \
     docker.io docker-compose-v2 containerd runc jq openssl pciutils iproute2 curl ca-certificates netplan.io' >> "$INSTALL_LOG" 2>&1; then
     echo "FATAL: Offline package installation failed." | tee -a "$INSTALL_LOG" >&2
     exit 1
   fi
+
+  # Clean up policy-rc.d
+  rm -f /target/usr/sbin/policy-rc.d 2>/dev/null || true
 
   # Remove local repo and restore online repository configurations
   rm -f /target/etc/apt/sources.list.d/olg-offline.list
@@ -169,6 +197,7 @@ if [ -f /target/opt/olg/images/vyos-golden.qcow2 ]; then
     (cd /target/opt/olg/images && sha256sum vyos-golden.qcow2 > vyos-golden.qcow2.sha256)
   fi
   chmod 0444 /target/opt/olg/images/vyos-golden.qcow2.sha256 2>/dev/null || true
+  [ -f /target/opt/olg/images/vyos-golden.qcow2.attestation.json ] && chmod 0444 /target/opt/olg/images/vyos-golden.qcow2.attestation.json 2>/dev/null || true
 fi
 
 # 7. Install and enable the Systemd Startup Service, Docker Service, and Libvirt
@@ -193,6 +222,9 @@ for svc in "${CRITICAL_SERVICES[@]}"; do
     exit 1
   fi
 done
+
+# Ensure libvirt-guests does not auto-start un-reconciled domains before olg-orchestrator
+chroot /target systemctl disable libvirt-guests.service >> "$INSTALL_LOG" 2>&1 || true
 
 # 8. Ensure pre-cached Docker container archives are preserved in /opt/olg/docker-cache
 # (startup_node.sh will automatically load them on first boot)

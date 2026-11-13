@@ -3,6 +3,10 @@ set -e
 
 mkdir -p /etc/olg/secrets /etc/olg/device-certs /opt/olg/state /run/vyatta/config /run/vyos
 
+modprobe virtiofs 2>/dev/null || true
+modprobe virtio_pci 2>/dev/null || true
+
+
 # Mount guest_secrets virtiofs if not already mounted
 if ! grep -q "/etc/olg/secrets" /proc/mounts 2>/dev/null; then
   mount -t virtiofs guest_secrets /etc/olg/secrets 2>/dev/null || true
@@ -372,7 +376,7 @@ for i in $(seq 1 60); do
 
     if [ -f /run/vyos/boot_ready ] && \
        ! pgrep -f "/opt/vyatta/sbin/my_commit" >/dev/null 2>&1 && \
-       ! pgrep -f "vyos-router" >/dev/null 2>&1 && \
+       ! pgrep -f "/usr/libexec/vyos/init/vyos-router" >/dev/null 2>&1 && \
        [ -d "/sys/class/net/mgmt0" ] && \
        [ "$check_mgmt_mac" = "$MGMT_MAC" ] && \
        ip addr show dev mgmt0 2>/dev/null | grep -q "192.168.254.1/24" && \

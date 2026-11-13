@@ -104,10 +104,10 @@ olg-ubuntu-orchestrator/
 │   └── network_simulator.sh      # Network impairment emulation tool (planned)
 └── tools/                        # Auxiliary Binaries & Utilities
     ├── go.mod                    # Go module definition for tools
-    ├── nats_pki_bootstrap.go     # Go source code for NATS PKI bootstrapping utility
-    ├── nats_pki_bootstrap        # Compiled binary for Operator/Account/User JWT & .creds generation
-    ├── nats_kv_pusher.go         # Go source code for NATS KV pusher & TLS readiness probe
-    └── nats_kv_pusher            # Compiled binary to seed NATS KV configuration over TLS
+    ├── pki_init.go               # Go source code for NATS PKI bootstrapping utility
+    ├── pki_init                  # Compiled binary for Operator/Account/User JWT & .creds generation
+    ├── kv_config_init.go         # Go source code for NATS KV pusher & TLS readiness probe
+    └── kv_config_init            # Compiled binary to seed NATS KV configuration over TLS
 ```
 
 ---

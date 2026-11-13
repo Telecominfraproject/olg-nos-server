@@ -230,7 +230,7 @@ This document defines the technical specifications, structural design, input/out
          1. Ensures directories `/opt/olg/config/certs` and `/opt/olg/config/jwt` exist with directory mode `0700` owned by `root:root`.
          2. Generates an appliance-unique Root CA (`ca.key` mode `0600`, `ca.crt` mode `0644`) owned by `root:root`.
          3. Generates and issues NATS Server Certificate (`nats-server.key` mode `0600`, `nats-server.crt` mode `0644`) signed by the local CA with Subject Alternative Names: `DNS:nats-server,DNS:localhost,IP:192.168.254.2,IP:127.0.0.1`.
-         4. Executes `tools/nats_pki_bootstrap` to generate Operator Keypair/JWT, System and Application Account Keypairs/JWTs, and user decorated `.creds` files (`orchestrator.creds`, `ucentral.creds`, `vyos_agent.creds`) with strict subject permissions.
+         4. Executes `tools/pki_init` to generate Operator Keypair/JWT, System and Application Account Keypairs/JWTs, and user decorated `.creds` files (`orchestrator.creds`, `ucentral.creds`, `vyos_agent.creds`) with strict subject permissions.
          5. Ensures directories `/etc/olg/client` and `/etc/olg/guest-secrets` exist with directory mode `0700` owned by `root:root`.
          6. Copies `ca.crt` (`0644`) to `/etc/olg/client/ca.crt` and `/etc/olg/guest-secrets/ca.crt`.
          7. Writes `/etc/olg/guest-secrets/agent.env` (`0600 root:root`) referencing `NATS_SERVER=tls://192.168.254.2:4222`, `NATS_CREDS_FILE=/etc/olg/secrets/vyos_agent.creds`, and `NATS_CA_FILE=/etc/olg/secrets/ca.crt`.
@@ -243,14 +243,14 @@ This document defines the technical specifications, structural design, input/out
      * **Deterministic NATS TLS & JetStream Readiness Gate**:
        - To eliminate cold-boot race conditions where NATS is still initializing listeners, resolver mappings, or JetStream storage when callers attempt KV operations, `startup_node.sh` enforces a bounded readiness check before proceeding:
          1. *Container State Check*: Polls `docker inspect -f '{{.State.Running}}' nats-server` until `true` (up to 10-second timeout).
-         2. *Authenticated TLS JetStream Probe*: Executes `tools/nats_kv_pusher --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --server tls://127.0.0.1:4222 --probe-only` with retry backoff (polling every 500ms up to a 15-second timeout window). The probe validates TCP connection, TLS handshake, SAN validation, Operator/Account JWT authentication, and JetStream engine readiness.
+         2. *Authenticated TLS JetStream Probe*: Executes `tools/kv_config_init --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --server tls://127.0.0.1:4222 --probe-only` with retry backoff (polling every 500ms up to a 15-second timeout window). The probe validates TCP connection, TLS handshake, SAN validation, Operator/Account JWT authentication, and JetStream engine readiness.
        - **Readiness Failure Policy**: If NATS fails to become ready within the 15-second window, `startup_node.sh` aborts immediately (`exit 1`) with error `ERROR: NATS JetStream readiness probe failed after 15s; aborting deployment before VFIO handoff`.
   7. **Conditional NATS JetStream State Seeding**:
-     * Once the readiness gate confirms NATS is healthy, `startup_node.sh` invokes `tools/nats_kv_pusher` to establish the baseline configuration state:
+     * Once the readiness gate confirms NATS is healthy, `startup_node.sh` invokes `tools/kv_config_init` to establish the baseline configuration state:
        - **If `--force-reseed` IS set (Force Overwrite)**:
-         Executes `./tools/nats_kv_pusher --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --payload ./config/vyos_initial_state.json --force` over TLS to unconditionally overwrite `desired.vyos` in bucket `cfg_desired`, resetting router configuration to the baseline envelope.
+         Executes `./tools/kv_config_init --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --payload ./config/vyos_initial_state.json --force` over TLS to unconditionally overwrite `desired.vyos` in bucket `cfg_desired`, resetting router configuration to the baseline envelope.
        - **If `--force-reseed` is NOT set (Default Conditional Seeding)**:
-         Executes `./tools/nats_kv_pusher --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --payload ./config/vyos_initial_state.json --if-not-exists` over TLS. `nats_kv_pusher` inspects bucket `cfg_desired` and seeds the baseline envelope ONLY if `desired.vyos` is missing/empty, preserving any existing cloud-delivered configuration during normal boots and node recoveries.
+         Executes `./tools/kv_config_init --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --payload ./config/vyos_initial_state.json --if-not-exists` over TLS. `kv_config_init` inspects bucket `cfg_desired` and seeds the baseline envelope ONLY if `desired.vyos` is missing/empty, preserving any existing cloud-delivered configuration during normal boots and node recoveries.
   8. **Idempotent VFIO PCI Driver Binding (`driver_override` Contract)**:
      * **Already-Bound State Handling**: Inspects currently active driver via `readlink /sys/bus/pci/devices/$BDF/driver`. If a target device is already bound to `vfio-pci`, re-binding is skipped to prevent disrupting active device handles.
      * **Native Driver Detection & Unbind**: If bound to a native host driver (e.g., `r8169`, `e1000e`, `igb`, `ixgbe`), detaches the interface from host bridges (`nomaster`) and executes unbind.
@@ -369,10 +369,11 @@ This document defines the technical specifications, structural design, input/out
             ;;
         esac
         ```
+      * **Normalized Hostdev Hardware Reconciliation**: When `vyos-router` is already in `running` state, `startup_node.sh` parses and normalizes the physical PCI and USB hostdev assignments from `virsh dumpxml` and the desired domain XML via `extract_normalized_hostdevs`. It ignores runtime-generated guest PCI addresses, driver tags, and XML formatting artifacts. The active VM is destroyed and recreated only if physical hardware assignments actually differ. If hardware comparison cannot be completed safely (e.g. malformed XML), the running router is preserved without disruption.
   10. **Post-Boot VyOS Management Gateway Verification (Zero-SSH Declarative Model)**:
       * Following domain launch, `startup_node.sh` performs a non-invasive network health probe verifying reachability of the VyOS management gateway interface (`192.168.254.1`) on `br-mgmt`.
       * **Zero-SSH Invariant**: The host orchestrator does NOT require SSH credentials, keys, or interactive remote commands (`sshpass` and host-side SSH execution are prohibited). All in-guest configuration is managed declaratively by `vyos-nats-agent` subscribing to NATS JetStream `cfg_desired`.
-      * **Kea DHCP Bridge Interface Binding (`listen-interface br1`)**: To ensure the Kea DHCP server on VyOS responds reliably on LAN bridges without dropping requests on unnumbered slave ports (such as USB Ethernet `eth2`), the binding `set service dhcp-server listen-interface br1` is baked directly into the base golden master image (`/opt/olg/images/vyos-golden.qcow2`) via `/config/scripts/vyos-postconfig-bootup.script` and the baseline desired configuration.
+      * **Kea DHCP Bridge Interface Raw Socket Rebinding**: ISC Kea DHCPv4 in VyOS uses raw packet sockets (`dhcp-socket-type: raw`). To ensure the Kea DHCP daemon reliably binds to active LAN bridge interfaces (`br1`) and serves IP addresses to client devices across dynamic commits and system reboots, an automated postconfig trigger (`vyos-postconfig-bootup.script`) and VyOS commit hook (`/config/scripts/commit/post-hooks.d/10-restart-kea`) are installed directly into the golden master image (`/opt/olg/images/vyos-golden.qcow2`) to restart `isc-kea-dhcp4-server` once interface addresses are bound.
   11. **Single VM Startup Owner Contract & Clean Service Exit**: Explicitly disables libvirt domain autostart (`virsh autostart --disable vyos-router`) to ensure `startup_node.sh` remains the sole boot-time orchestrator before handing off crash recovery to Libvirt. Exits cleanly with status code `0`.
 
 ---
@@ -408,7 +409,7 @@ This document defines the technical specifications, structural design, input/out
 
 ## 5. Auxiliary Tools Specification (`tools/`)
 
-#### 5.1 `tools/nats_pki_bootstrap` & `tools/nats_pki_bootstrap.go`
+#### 5.1 `tools/pki_init` & `tools/pki_init.go`
 * **Purpose**: Compiled Go utility that generates and manages the NATS 2.0+ Operator / Account / User cryptographic identity hierarchy using standard `github.com/nats-io/nkeys` and `github.com/nats-io/jwt/v2`. Generates Operator and Account Keypairs/JWTs, issues signed User JWTs with explicit publish/subscribe permissions, and outputs standard decorated `.creds` files formatted via `jwt.FormatUserConfig` (containing both User JWT and User NKey Seed).
 * **CLI Arguments & Modes**:
   * `--mode bootstrap` (default): Initializes the complete appliance NATS PKI:
@@ -421,7 +422,7 @@ This document defines the technical specifications, structural design, input/out
   * `--mode rotate-user --user <NAME> --out <PATH>`: Generates a new User Keypair, signs a new User JWT using active Account NKey (`/opt/olg/config/jwt/olg_account.nk`), and writes a candidate decorated `.creds` file to `<PATH>`.
   * `--mode verify-creds --creds <PATH>`: Validates that `<PATH>` contains a valid decorated NATS credential parsable by `jwt.ParseDecoratedJWT` and `jwt.ParseDecoratedNKey`.
 
-#### 5.2 `tools/nats_kv_pusher` & `tools/nats_kv_pusher.go`
+#### 5.2 `tools/kv_config_init` & `tools/kv_config_init.go`
 * **Purpose**: Compiled Go utility that securely connects via TLS to the NATS JetStream server (`tls://127.0.0.1:4222` or `tls://192.168.254.2:4222`) using the local appliance Root CA (`/opt/olg/config/certs/ca.crt`) with standard certificate verification against configured SANs (`127.0.0.1`, `192.168.254.2`, `localhost`, `nats-server`), authenticates using orchestrator credentials via decorated credentials file (`/opt/olg/config/jwt/orchestrator.creds` or CLI flag `--creds`), initializes Key-Value bucket `cfg_desired`, and publishes `./config/vyos_initial_state.json` under key `desired.vyos`.
 * **CLI Arguments & Flags**:
   * `--server <URL>`: NATS TLS endpoint (default `tls://127.0.0.1:4222`).
@@ -519,7 +520,7 @@ This document defines the technical specifications, structural design, input/out
   | **Subscribe Status / Health / Results** | **YES** | **YES** | **NO** |
 * **Per-User Permissions & Decorated `.creds` Specification**:
   1. **`orchestrator` (`/opt/olg/config/jwt/orchestrator.creds`)**:
-     - **Role**: Host boot reconciliation and initial state seeding (`startup_node.sh`, `nats_kv_pusher`).
+     - **Role**: Host boot reconciliation and initial state seeding (`startup_node.sh`, `kv_config_init`).
      - **Permissions**: Administrative JetStream access to create/update streams, buckets, and seed initial envelopes (`publish: [">"]`, `subscribe: [">"]`).
   2. **`ucentral_client` (`/etc/olg/client/ucentral.creds`)**:
      - **Role**: Cloud-facing gateway client connecting over the Docker bridge network.
@@ -676,7 +677,7 @@ This document defines the technical specifications, structural design, input/out
        - `/etc/olg/guest-secrets/agent.env.tmp`
      - **Participant Registration**: The tool compiles the exact list of staged files into a `participants` array (e.g. `["ucentral.creds", "vyos_agent.creds", "agent.env"]`).
      - **Preflight Cryptographic & Syntax Validation**:
-       - Validates that `ucentral.creds.tmp`, `vyos_agent.creds.tmp`, and `orchestrator.creds.tmp` are valid decorated NATS credentials parsable by `jwt.ParseDecoratedJWT` and `jwt.ParseDecoratedNKey` via `tools/nats_pki_bootstrap --mode verify-creds`.
+       - Validates that `ucentral.creds.tmp`, `vyos_agent.creds.tmp`, and `orchestrator.creds.tmp` are valid decorated NATS credentials parsable by `jwt.ParseDecoratedJWT` and `jwt.ParseDecoratedNKey` via `tools/pki_init --mode verify-creds`.
        - If `olg_account.jwt.tmp` or `resolver.conf.tmp` are staged, verifies account JWT signatures against `operator.jwt` and validates `resolver.conf.tmp` memory resolver preload syntax.
      - **Failure Handling**: If any preflight validation check fails (non-zero exit code), all `.tmp` files are deleted, the transaction is aborted, and all active configuration files and running states remain 100% untouched.
   2. **Phase 2: Active Generation Snapshot & Journal `PREPARED` Transition**:
@@ -712,7 +713,7 @@ This document defines the technical specifications, structural design, input/out
        - **Probe**: Verifies `docker exec` exit code `0` and confirms log entry `Reloaded server configuration` in `docker logs --since "$RELOAD_START" nats-server` within a 5-second timeout window.
      - **4b. Host Orchestrator Credential & NATS API Verification Probe (Probe 0)**:
        - Validates that newly installed `orchestrator.creds` can authenticate and issue JetStream requests against NATS:
-         `tools/nats_kv_pusher --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --server tls://127.0.0.1:4222 --probe-only`
+         `tools/kv_config_init --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --server tls://127.0.0.1:4222 --probe-only`
        - Guarantees `exitcode: 0` before proceeding to microservice client checks.
      - **4c. Cloud Client Restart & Auth Verification (Probe 1)**:
        - Tool restarts client container: `docker restart ucentral-client` (re-reads mounted `/etc/olg/client/config.json` and `/etc/olg/client/ucentral.creds` on start).
@@ -770,7 +771,7 @@ This document defines the technical specifications, structural design, input/out
               PID=$(echo "$RES" | jq -r '.return.pid')
               ```
          4. **Deterministic Rollback Verification Probes (Mirroring Phase 4 Probes)**:
-            - **Rollback Probe 0 (Orchestrator Probe)**: `tools/nats_kv_pusher --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --server tls://127.0.0.1:4222 --probe-only` returns `0`.
+            - **Rollback Probe 0 (Orchestrator Probe)**: `tools/kv_config_init --creds /opt/olg/config/jwt/orchestrator.creds --ca /opt/olg/config/certs/ca.crt --server tls://127.0.0.1:4222 --probe-only` returns `0`.
             - **Rollback Probe 1 (Cloud Client Auth Recovery)**: Verifies `docker inspect -f '{{.State.Running}}' ucentral-client` == `true` and checks container logs for successful authenticated NATS reconnection with zero `Authorization Violation` entries within 5 seconds.
             - **Rollback Probe 2 (QGA Agent Exec-Status)**: Polls QGA `guest-exec-status` for `$PID` every 500ms (up to 10s) to verify `exited: true` and `exitcode: 0`.
             - **Rollback Probe 3 (Service Active & Telemetry Heartbeat)**: Verifies `systemctl is-active vyos-nats-agent.service` returns `active` and confirms valid NATS telemetry on `health.>` / `status.>` within 10 seconds.

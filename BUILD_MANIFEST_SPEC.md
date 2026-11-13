@@ -15,6 +15,7 @@ The OpenLAN Gateway (OLG) appliance firmware build engine ([`build.sh`](./build.
 
 ```yaml
 version: "1.0"
+build_mode: "production"  # Optional: "production" (default) or "dev"
 
 vyos:
   # Base image, guest binaries, libraries, patches, and guest files
@@ -34,17 +35,30 @@ host:
 
 ---
 
-### 3.2 `vyos`
+### 3.2 `build_mode`
+* **Type**: `string`
+* **Required**: No (Default: `"production"`)
+* **Allowed Values**: `"production"`, `"dev"`
+* **Description**: Sets the appliance firmware security build mode:
+  * `"production"`: Secure-by-default mode. Universal default credentials (`vyos`/`vyos`) are strictly prohibited. The build requires an explicit, secure custom `admin_password` and asserts at build time that no default password hash exists in the final image. Image caches are isolated to prevent credential leakage. Authorized operators can securely access the console and cloud RTTY using their custom password.
+  * `"dev"`: Development and lab testing mode. Allows default development credentials (`vyos`/`vyos`) for immediate serial console access and local testing.
+* **CLI Overrides**: Can be explicitly overridden at invocation time via `./build.sh --dev` or `./build.sh --production`.
+
+---
+
+### 3.3 `vyos`
 Declares the base VyOS router disk, binaries to build and inject into the guest filesystem, shared libraries, and custom files.
 
 #### 3.2.1 `vyos.base_image`
-Configures the base VyOS QCOW2 disk image used as the golden template.
+Configures the base VyOS disk image used as the golden template. Supports either a pre-installed QCOW2 virtual disk (e.g. `"vyos-base.qcow2"`) OR an official VyOS installer ISO (e.g. `"vyos-2026.03-generic-amd64.iso"`). When an ISO is supplied, `build.sh` automatically converts it into a bootable QCOW2 disk via unattended installation.
 
 | Parameter | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
-| `cache_name` | `string` | Yes | Expected disk image filename located in `build/cache/` (e.g. `"vyos-base.qcow2"`). |
-| `url` | `string` | No | Optional HTTP/HTTPS fallback URL to automatically download the base image if missing from cache. |
-| `sha256` | `string` | No | Optional expected SHA-256 checksum to verify base disk integrity before extraction/customization. Build aborts if hash does not match. |
+| `cache_name` | `string` | Yes | Expected image filename in `build/cache/` (e.g. `"vyos-2026.03-generic-amd64.iso"` or `"vyos-base.qcow2"`). |
+| `url` | `string` | No | Optional HTTP/HTTPS URL to automatically download the base image if missing from cache. |
+| `sha256` | `string` | No | Optional expected SHA-256 checksum to verify base image integrity before installation/customization. |
+| `disk_size` | `string` | No | Virtual disk capacity when converting from ISO (Default: `"10G"`). |
+| `admin_password` | `string` | No | Administrative password for user `vyos`. In `production` mode, an explicit secure custom password is required (default `'vyos'` is rejected). In `dev` mode, defaults to `'vyos'`. |
 
 #### 3.2.2 `vyos.binaries[]`
 List of guest binaries compiled on the host and injected into the VyOS root filesystem.
@@ -101,10 +115,10 @@ Utilities compiled on the host for orchestration and state seeding.
 
 | Parameter | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
-| `name` | `string` | Yes | Name of binary (e.g. `nats_pki_bootstrap`, `nats_kv_pusher`). |
+| `name` | `string` | Yes | Name of binary (e.g. `pki_init`, `kv_config_init`). |
 | `type` | `string` | Yes | Toolchain (currently `go`). |
 | `local_path` | `string` | Yes | Relative path to source code / main `.go` file. |
-| `dest` | `string` | Yes | Target destination within `/opt/olg/` (e.g. `tools/nats_pki_bootstrap`). |
+| `dest` | `string` | Yes | Target destination within `/opt/olg/` (e.g. `tools/pki_init`). |
 | `build_cmd` | `string` | Yes (for `go`) | Exact compilation command string. `{output}` is replaced with the target binary path. Required for Go binaries. |
 
 #### 3.3.2 `host.containers[]`
@@ -228,13 +242,13 @@ sudo ./build.sh --config custom-build.yaml
 To satisfy strict enterprise security audit requirements and guarantee reproducibility:
 1. **Source Integrity Validation**: Base disk and ISO images can be pinned with SHA-256 hashes (`vyos.base_image.sha256` and `host.ubuntu_iso_sha256`). The builder computes SHA-256 hashes immediately after download/cache resolution and aborts on any mismatch.
 2. **Pinned Git Commit SHAs & Container Digests**: All repository references (`ref`) support exact 40-character Git commit SHAs, and container pulls (`image`) support immutable digests (e.g. `nats@sha256:...`).
-3. **Automated Provenance Manifest (`provenance.json`)**:
+3. **Automated Image Details Manifest (`image_details.json`)**:
    During the build process, the builder dynamically resolves and logs exact Git commit SHAs (via `git rev-parse HEAD`), Docker image IDs and repo digests (via `docker inspect`), base image hashes, and resulting artifact checksums.
-   - Output path on host: `build/output/provenance.json`
-   - Installed path on appliance: `/etc/olg/provenance.json`
-   - Payload path in installer ISO: `/olg-payload/config/provenance.json`
+   - Output path on host: `build/output/image_details.json`
+   - Installed path on appliance: `/etc/olg/image_details.json`
+   - Payload path in installer ISO: `/olg-payload/config/image_details.json`
 
-Example `provenance.json`:
+Example `image_details.json`:
 ```json
 {
   "schema_version": "1.0",
@@ -265,12 +279,12 @@ Example `provenance.json`:
   ],
   "host_binaries": [
     {
-      "name": "nats_pki_bootstrap",
+      "name": "pki_init",
       "type": "go",
       "repo": "local",
       "ref": "local",
       "commit_sha": "local",
-      "dest": "tools/nats_pki_bootstrap"
+      "dest": "tools/pki_init"
     }
   ],
   "containers": [

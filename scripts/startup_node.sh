@@ -761,11 +761,12 @@ fi
 
 # Tier 3: NATS Operator, Account, and User Credential Reconciliation
 BOOTSTRAP_BIN=""
-if [ -x "$BASE_DIR/tools/nats_pki_bootstrap" ]; then
-  BOOTSTRAP_BIN="$BASE_DIR/tools/nats_pki_bootstrap"
-elif [ -x "$TOOLS_DIR/nats_pki_bootstrap" ]; then
-  BOOTSTRAP_BIN="$TOOLS_DIR/nats_pki_bootstrap"
-fi
+for candidate in "$BASE_DIR/tools/pki_init" "$TOOLS_DIR/pki_init"; do
+  if [ -x "$candidate" ]; then
+    BOOTSTRAP_BIN="$candidate"
+    break
+  fi
+done
 
 REQUIRED_JWTS=("$JWT_DIR/operator.jwt" "$JWT_DIR/sys_account.jwt" "$JWT_DIR/olg_account.jwt" "$JWT_DIR/orchestrator.creds" "$CLIENT_DIR/ucentral.creds" "$GUEST_SECRETS_DIR/vyos_agent.creds" "$CONFIG_DIR/resolver.conf")
 NATS_CREDS_RECONCILE="false"
@@ -787,8 +788,8 @@ done
 
 if [ "$NATS_CREDS_RECONCILE" = "true" ]; then
   if [ -z "$BOOTSTRAP_BIN" ]; then
-    log_error "CRITICAL ERROR: NATS credential reconciliation is required, but nats_pki_bootstrap binary was not found or is not executable."
-    log_error "Checked paths: $BASE_DIR/tools/nats_pki_bootstrap and $TOOLS_DIR/nats_pki_bootstrap"
+    log_error "CRITICAL ERROR: NATS credential reconciliation is required, but pki_init binary was not found or is not executable."
+    log_error "Checked paths: $BASE_DIR/tools/pki_init and $TOOLS_DIR/pki_init"
     exit 1
   fi
   log_info "Reconciling NATS JWTs, account keys, and user credentials..."
@@ -989,11 +990,16 @@ fi
 
 docker compose -f "$OPT_OLG_DIR/docker-compose.yml" up -d --force-recreate nats-server
 
-KV_PUSHER="$BASE_DIR/tools/nats_kv_pusher"
-[ ! -x "$KV_PUSHER" ] && [ -x "$TOOLS_DIR/nats_kv_pusher" ] && KV_PUSHER="$TOOLS_DIR/nats_kv_pusher"
+KV_INIT_BIN=""
+for candidate in "$BASE_DIR/tools/kv_config_init" "$TOOLS_DIR/kv_config_init"; do
+  if [ -x "$candidate" ]; then
+    KV_INIT_BIN="$candidate"
+    break
+  fi
+done
 
-if [ ! -x "$KV_PUSHER" ]; then
-  log_error "NATS KV pusher binary not found or not executable (checked $BASE_DIR/tools/nats_kv_pusher and $TOOLS_DIR/nats_kv_pusher)"
+if [ -z "$KV_INIT_BIN" ]; then
+  log_error "KV config init binary not found or not executable (checked $BASE_DIR/tools/kv_config_init and $TOOLS_DIR/kv_config_init)"
   exit 1
 fi
 
@@ -1004,7 +1010,7 @@ NATS_READY=false
 
 log_info "Probing NATS TLS connection and JetStream readiness..."
 while [ $(( $(date +%s) - PROBE_START_TIME )) -lt "$MAX_PROBE_WAIT_SECS" ]; do
-  if "$KV_PUSHER" \
+  if "$KV_INIT_BIN" \
       --server "tls://127.0.0.1:4222" \
       --creds "$JWT_DIR/orchestrator.creds" \
       --ca "$CERTS_DIR/ca.crt" \
@@ -1035,7 +1041,7 @@ fi
 SEED_FLAG="--if-not-exists"
 [ "$FLAG_FORCE_RESEED" = "true" ] && SEED_FLAG="--force"
 
-if ! "$KV_PUSHER" \
+if ! "$KV_INIT_BIN" \
     --server "tls://127.0.0.1:4222" \
     --creds "$JWT_DIR/orchestrator.creds" \
     --ca "$CERTS_DIR/ca.crt" \
@@ -1234,15 +1240,6 @@ elif [ "$LAN_TYPE" = "usb" ] && [ -n "$LAN_USB_BUS" ] && [ -n "$LAN_USB_DEV" ]; 
       </source>
     </hostdev>
 EOF
-elif [ "$LAN_TYPE" = "usb" ] && [ -n "$LAN_USB_VENDOR" ] && [ -n "$LAN_USB_PRODUCT" ]; then
-  cat <<EOF >> "$DOMAIN_XML_FILE"
-    <hostdev mode='subsystem' type='usb' managed='yes'>
-      <source>
-        <vendor id='0x${LAN_USB_VENDOR}'/>
-        <product id='0x${LAN_USB_PRODUCT}'/>
-      </source>
-    </hostdev>
-EOF
 fi
 
 cat <<EOF >> "$DOMAIN_XML_FILE"
@@ -1256,29 +1253,122 @@ if ! virt-xml-validate "$DOMAIN_XML_FILE" domain >/dev/null 2>&1; then
   exit 1
 fi
 
+# Helper: Extract and normalize physical hostdev devices (PCI/USB) from domain XML
+extract_normalized_hostdevs() {
+  local xml_source="$1"
+  python3 - "$xml_source" <<'EOF_EXTRACT_HW'
+import sys
+import xml.etree.ElementTree as ET
+
+source = sys.argv[1]
+try:
+    if source.strip().startswith("<"):
+        root = ET.fromstring(source)
+    else:
+        root = ET.parse(source).getroot()
+except Exception as e:
+    sys.stderr.write(f"XML parse error: {e}\n")
+    sys.exit(2)
+
+devs = []
+for hostdev in root.findall(".//devices/hostdev"):
+    htype = hostdev.get("type")
+    source_elem = hostdev.find("source")
+    if source_elem is None:
+        continue
+    addr = source_elem.find("address")
+    if htype == "pci" and addr is not None:
+        try:
+            dom = int(addr.get("domain", "0"), 16)
+            bus = int(addr.get("bus", "0"), 16)
+            slot = int(addr.get("slot", "0"), 16)
+            fn = int(addr.get("function", "0"), 16)
+            devs.append(f"pci:{dom:04x}:{bus:02x}:{slot:02x}.{fn:x}")
+        except ValueError as ve:
+            sys.stderr.write(f"Invalid PCI address format: {ve}\n")
+            sys.exit(2)
+    elif htype == "usb":
+        if addr is not None and addr.get("bus") is not None and addr.get("device") is not None:
+            try:
+                bus = int(addr.get("bus"))
+                dev = int(addr.get("device"))
+                devs.append(f"usb:bus={bus}:dev={dev}")
+            except ValueError as ve:
+                sys.stderr.write(f"Invalid USB address format: {ve}\n")
+                sys.exit(2)
+        else:
+            vendor = source_elem.find("vendor")
+            product = source_elem.find("product")
+            if vendor is not None and product is not None:
+                vid = vendor.get("id", "").lower().strip()
+                pid = product.get("id", "").lower().strip()
+                devs.append(f"usb:vendor={vid}:product={pid}")
+
+devs.sort()
+print(",".join(devs))
+EOF_EXTRACT_HW
+}
+
 VM_STATE=$(virsh domstate vyos-router 2>/dev/null | tr -d '[:space:]' || true)
 [ -z "$VM_STATE" ] && VM_STATE="shut off"
 
-if [ "$VM_STATE" = "running" ] && [ "$FLAG_RECREATE_VM" = "true" ]; then
-  log_info "Recreation requested: stopping running vyos-router instance..."
-  virsh destroy vyos-router >/dev/null 2>&1 || true
-  VM_STATE="shut off"
+RECREATE_REASON=""
+HW_VERIFIED="false"
+
+if [ "$FLAG_RECREATE_VM" = "true" ]; then
+  RECREATE_REASON="Explicit --recreate-vm requested"
+elif [ "$VM_STATE" != "running" ]; then
+  RECREATE_REASON="VM state is '$VM_STATE'"
+else
+  # Running instance: compare current effective hostdev hardware with desired configuration
+  CURRENT_XML=$(virsh dumpxml vyos-router 2>/dev/null || true)
+  if [ -z "$CURRENT_XML" ]; then
+    log_warn "Failed to dump XML for running vyos-router domain. Preserving active router instance and skipping domain redefinition."
+  else
+    CURRENT_HW=$(extract_normalized_hostdevs "$CURRENT_XML" 2>/dev/null || echo "__ERROR__")
+    DESIRED_HW=$(extract_normalized_hostdevs "$DOMAIN_XML_FILE" 2>/dev/null || echo "__ERROR__")
+
+    if [ "$CURRENT_HW" = "__ERROR__" ] || [ "$DESIRED_HW" = "__ERROR__" ]; then
+      log_warn "Hardware comparison could not be completed safely (XML parsing error). Preserving running vyos-router instance and skipping domain redefinition to prevent altering next-boot configuration."
+    elif [ "$CURRENT_HW" != "$DESIRED_HW" ]; then
+      log_info "Hardware change detected: active domain (${CURRENT_HW:-none}) != desired (${DESIRED_HW:-none})."
+      RECREATE_REASON="Hardware configuration mismatch between active domain and dynamic profile"
+    else
+      # Confirmed hardware matches exactly
+      HW_VERIFIED="true"
+    fi
+  fi
 fi
 
-if [ "$FLAG_RECREATE_VM" = "true" ] || [ "$VM_STATE" = "shut off" ]; then
+if [ -n "$RECREATE_REASON" ]; then
+  log_info "Reconciling vyos-router domain: ${RECREATE_REASON}."
+  if [ "$VM_STATE" = "running" ]; then
+    log_info "Stopping active vyos-router instance to apply updated hardware configuration..."
+    virsh destroy vyos-router >/dev/null 2>&1 || true
+  fi
+
+  log_info "Updating vyos-router domain definition from $DOMAIN_XML_FILE..."
   virsh undefine vyos-router --nvram >/dev/null 2>&1 || virsh undefine vyos-router >/dev/null 2>&1 || true
+
   if ! virsh define "$DOMAIN_XML_FILE"; then
     log_error "FATAL: Failed to define vyos-router domain from $DOMAIN_XML_FILE."
     exit 1
   fi
-fi
 
-if [ "$VM_STATE" != "running" ]; then
   log_info "Starting vyos-router domain..."
-  virsh start vyos-router
+  if ! virsh start vyos-router; then
+    log_error "FATAL: Failed to start vyos-router domain."
+    exit 1
+  fi
   log_info "vyos-router domain started [OK]."
 else
-  log_info "vyos-router domain is already running [OK]."
+  if [ "$HW_VERIFIED" = "true" ]; then
+    log_info "Active vyos-router domain matches desired hardware and is healthy. Preserving running instance without disruption."
+    # Update persistent domain definition non-disruptively for future cold boots
+    virsh define "$DOMAIN_XML_FILE" >/dev/null 2>&1 || true
+  else
+    log_info "Active vyos-router instance preserved without modification (hardware comparison was unverified; persistent definition untouched)."
+  fi
 fi
 
 virsh autostart --disable vyos-router >/dev/null 2>&1 || true
