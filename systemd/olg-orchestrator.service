@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenLAN Gateway (OLG) Node Orchestrator & Boot Reconciliation
+After=network-online.target libvirtd.service docker.service
+Requires=libvirtd.service docker.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/olg/scripts/startup_node.sh
+Restart=on-failure
+RestartSec=20s
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+

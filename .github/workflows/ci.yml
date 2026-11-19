@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-syntax-check:
+    name: Shell Syntax Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Bash Script Syntax
+        run: |
+          set -e
+          echo "Checking syntax of build.sh..."
+          bash -n build.sh
+          for script in scripts/*.sh build/iso/scripts/*.sh; do
+            [ -f "$script" ] || continue
+            echo "Checking syntax: $script"
+            bash -n "$script"
+          done
+          echo "All shell scripts passed syntax validation."
+
+  regression-tests:
+    name: Regression & Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install pyyaml pexpect
+
+      - name: Run Test Suite
+        run: |
+          python3 -m unittest discover -v tests

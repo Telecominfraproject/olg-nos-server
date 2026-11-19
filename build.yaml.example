@@ -1,0 +1,135 @@
+# ==============================================================================
+# OpenLAN Gateway (OLG) Enterprise Appliance Manifest
+# Single declarative specification for VyOS, Host, Binaries, Patches & Cloud
+# ==============================================================================
+
+version: "1.0"
+
+# Firmware build mode: 'production' (default: secure-by-default, locks default credentials)
+# or 'dev' (enables default development credentials 'vyos' for local lab testing).
+# Can be overridden via CLI flags '--dev' or '--production'.
+build_mode: "production"
+
+# ------------------------------------------------------------------------------
+# VyOS Router VM Components
+# Each binary is built (with optional patches) and injected into vyos-golden.qcow2
+# ------------------------------------------------------------------------------
+vyos:
+  base_image:
+    # Supply either a pre-installed VyOS QCOW2 (e.g. "vyos-base.qcow2")
+    # OR an official VyOS installer ISO (e.g. "vyos-rolling-amd64.iso").
+    # When an ISO is provided, build.sh automatically installs VyOS into a bootable QCOW2.
+    cache_name: "vyos-2026.03-generic-amd64.iso"
+    url: "https://community-downloads.vyos.dev/stream/2026.03/vyos-2026.03-generic-amd64.iso"
+    sha256: "56151a536e4a70c1a3f9202d8e6e59e7dd308cc84e2c50b633884a1376a39010" # SHA-256 checksum for source image verification
+    disk_size: "10G" # Virtual disk capacity (Default: "10G")
+    # Administrative password for user 'vyos'. In 'production' mode, a secure custom password
+    # must be provided here in build.yaml (the default 'vyos' is rejected).
+    # In 'dev' mode, defaults to 'vyos' if omitted. Left empty by default to prevent hardcoded credentials.
+    admin_password: ""
+
+  binaries:
+    - name: vyos-nats-agent
+      type: go
+      repo: "https://github.com/RouterArchitects/TIP-olg-server-vyos-client-natsagent.git"
+      ref: "feat/rtty" # Branch, tag, or pinned Git commit SHA
+      local_path: "../TIP-olg-server-vyos-client-natsagent"
+      dest: "/usr/local/bin/vyos-nats-agent"
+      build_cmd: "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags='-w -s' -o {output} ./cmd/..."
+
+    - name: rtty
+      type: cmake
+      url: "https://github.com/zhaojh329/rtty/releases/download/v7.1.4/rtty-7.1.4.tar.gz"
+      dest: "/usr/sbin/rtty"
+      build_container: "debian:bookworm-slim"
+      cmake_args: "-DRTTY_USE_OPENSSL=ON"
+      libraries:
+        - "/usr/lib/x86_64-linux-gnu/libev.so.4*"
+      patches:
+        repo: "https://github.com/routerarchitects/ra_wlan-ap.git"
+        ref: "Router-Architects_Main"
+        path: "feeds/ucentral/rtty/patches"
+        local_dir: "../ra_wlan-ap/feeds/ucentral/rtty/patches"
+
+# ------------------------------------------------------------------------------
+# Host Ubuntu OS Components
+# Binaries, containers and packages packaged into the air-gapped Ubuntu installer ISO
+# ------------------------------------------------------------------------------
+host:
+  ubuntu_release: "26.04"
+  ubuntu_iso_url: "https://releases.ubuntu.com/26.04/ubuntu-26.04.1-live-server-amd64.iso"
+  ubuntu_iso_sha256: "cc8a95cde20f6ced61a322420de00f10cc3c90ced545daa46cb9c1a117f1d927" # Optional expected SHA-256 checksum for base Ubuntu installer ISO
+  hardware_profile: "config/hardware-profiles/acer-aspire-gateway.json"
+
+  binaries:
+    - name: pki_init
+      type: go
+      local_path: "tools/pki_init.go"
+      dest: "tools/pki_init"
+      build_cmd: "CGO_ENABLED=0 go build -ldflags='-w -s' -o {output} pki_init.go"
+
+    - name: kv_config_init
+      type: go
+      local_path: "tools/kv_config_init.go"
+      dest: "tools/kv_config_init"
+      build_cmd: "CGO_ENABLED=0 go build -ldflags='-w -s' -o {output} kv_config_init.go"
+
+  containers:
+    - name: ucentral-client
+      type: docker-build
+      repo: "https://github.com/RouterArchitects/TIP-olg-ucentral-client.git"
+      ref: "RA-dev-main" # Branch, tag, or pinned Git commit SHA
+      # local_path: "../TIP-olg-ucentral-client"
+      tag: "ucentral-client:latest"
+      cache_tar: "docker-cache/ucentral-client.tar"
+
+    - name: nats-server
+      type: docker-pull
+      # Pinned image tag or immutable digest (e.g., nats@sha256:...)
+      image: "nats:2.10-alpine"
+      cache_tar: "docker-cache/nats-server.tar"
+
+  # ------------------------------------------------------------------------------
+  # Host Custom Files & Configurations (Optional)
+  # Generic mechanism to inject arbitrary custom files, configurations, capabilities,
+  # or scripts onto the appliance host filesystem (supports local_path or url).
+  # NOTE: This section is strictly optional. If any file is declared, it must exist
+  # at the specified path (otherwise build.sh aborts to prevent incomplete builds).
+  # ------------------------------------------------------------------------------
+  files: []
+  # Example: Uncomment to inject optional custom capabilities or mTLS certificates:
+  # files:
+  #   - name: "capabilities"
+  #     local_path: "config/capabilities.json"
+  #     dest: "/etc/ucentral/capabilities.json"
+  #     mode: "0644"
+  #   - name: "device-ca-cert"
+  #     local_path: "certs/ca.pem"
+  #     dest: "/etc/olg/device-certs/ca.pem"
+  #     mode: "0644"
+  #   - name: "device-client-cert"
+  #     local_path: "certs/cert.pem"
+  #     dest: "/etc/olg/device-certs/cert.pem"
+  #     mode: "0644"
+  #   - name: "device-client-key"
+  #     local_path: "certs/key.pem"
+  #     dest: "/etc/olg/device-certs/key.pem"
+  #     mode: "0600"
+
+  offline_packages:
+    - qemu-system-x86
+    - qemu-utils
+    - libvirt-daemon-system
+    - libvirt-clients
+    - virtiofsd
+    - docker.io
+    - docker-compose-v2
+    - containerd
+    - runc
+    - jq
+    - openssl
+    - pciutils
+    - iproute2
+    - curl
+    - ca-certificates
+    - netplan.io

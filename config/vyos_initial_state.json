@@ -1,0 +1,79 @@
+{
+  "uuid": 1789126708,
+  "interfaces": [
+    {
+      "name": "WAN",
+      "role": "upstream",
+      "ipv4": {
+        "addressing": "dynamic"
+      },
+      "ethernet": [
+        {
+          "select-ports": [
+            "WAN*"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "LAN",
+      "role": "downstream",
+      "ipv4": {
+        "addressing": "static",
+        "subnet": "192.168.100.1/24",
+        "dhcp": {
+          "lease-start": "192.168.100.10",
+          "lease-end": "192.168.100.200",
+          "lease-first": 10,
+          "lease-count": 190,
+          "lease-time": "24h"
+        }
+      },
+      "ethernet": [
+        {
+          "select-ports": [
+            "LAN1"
+          ]
+        }
+      ]
+    }
+  ],
+  "services": {
+    "ssh": {
+      "port": 22
+    }
+  },
+  "nat": {
+    "snat": {
+      "rules": [
+        {
+          "rule-id": 100,
+          "out-interface": {
+            "name": "br0"
+          },
+          "source": {
+            "address": "192.168.0.0/16"
+          },
+          "translation": {
+            "address": "masquerade"
+          }
+        }
+      ]
+    }
+  },
+  "firewall": {
+    "rulesets": {
+      "LAN_TO_MGMT": {
+        "description": "Block LAN clients from accessing host management network",
+        "rules": [
+          {
+            "rule": 10,
+            "action": "drop",
+            "source": "192.168.100.0/24",
+            "destination": "192.168.254.0/24"
+          }
+        ]
+      }
+    }
+  }
+}

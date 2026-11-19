@@ -1,0 +1,36 @@
+{
+  "cloud": {
+    "url": "wss://openwifi3.routerarchitects.com:15002",
+    "connect_timeout_seconds": 10,
+    "write_timeout_seconds": 10,
+    "ping_interval_seconds": 30,
+    "pong_timeout_seconds": 60,
+    "stable_session_threshold_seconds": 60,
+    "compression_threshold_bytes": 2048,
+    "max_frame_size_bytes": 11534336,
+    "max_consecutive_frame_errors": 20,
+    "tls": {
+      "ca_file": "/etc/olg/device-certs/ca.pem",
+      "client_cert_file": "/etc/olg/device-certs/cert.pem",
+      "client_key_file": "/etc/olg/device-certs/key.pem",
+      "server_name": "openwifi3.routerarchitects.com"
+    }
+  },
+  "nats": {
+    "servers": [
+      "tls://nats-server:4222"
+    ],
+    "credentials_file": "/etc/olg/client/ucentral.creds",
+    "ca_file": "/etc/olg/client/ca.crt",
+    "target": "vyos",
+    "allow_insecure_local_dev": false
+  },
+  "queues": {
+    "ws_writer_capacity": 500,
+    "emergency_capacity": 100,
+    "nats_publish_capacity": 100,
+    "command_result_capacity": 50,
+    "telemetry_capacity": 500,
+    "max_concurrent_requests": 100
+  }
+}

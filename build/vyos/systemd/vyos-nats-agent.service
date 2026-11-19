@@ -1,0 +1,35 @@
+[Unit]
+Description=VyOS NATS Declarative Agent
+After=vyos-router.service network-online.target
+Requires=vyos-router.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="PATH=/opt/vyatta/bin:/opt/vyatta/sbin:/opt/vyatta/share/vyatta-cfg/templates/scripts:/usr/libexec/vyos:/usr/libexec/vyos/validators:/usr/libexec/vyos/completion:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="vyos_libexec_dir=/usr/libexec/vyos"
+Environment="vyos_validators_dir=/usr/libexec/vyos/validators"
+Environment="vyos_completion_dir=/usr/libexec/vyos/completion"
+Environment="vyos_conf_scripts_dir=/usr/libexec/vyos/conf_mode"
+Environment="vyos_op_scripts_dir=/usr/libexec/vyos/op_mode"
+Environment="vyos_sbindir=/opt/vyatta/sbin"
+Environment="vyos_bindir=/opt/vyatta/bin"
+Environment="vyos_templates_dir=/opt/vyatta/share/vyatta-cfg/templates"
+Environment="vyos_datadir=/opt/vyatta/share/vyatta-cfg"
+Environment="vyos_sysconfdir=/etc/vyos"
+Environment="vyatta_libexecdir=/usr/libexec/vyos"
+Environment="vyatta_validators_dir=/usr/libexec/vyos/validators"
+Environment="vyatta_sbindir=/opt/vyatta/sbin"
+Environment="vyatta_bindir=/opt/vyatta/bin"
+Environment="vyatta_templates_dir=/opt/vyatta/share/vyatta-cfg/templates"
+Environment="vyatta_helpers_dir=/opt/vyatta/share/vyatta-cfg/templates/scripts"
+Environment="vyatta_datadir=/opt/vyatta/share/vyatta-cfg"
+Environment="vyatta_sysconfdir=/opt/vyatta/etc"
+ExecStartPre=/usr/local/bin/vyos-nats-agent-prestart.sh
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/local/bin/vyos-nats-agent --config /etc/vyos-nats-agent/config.yaml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

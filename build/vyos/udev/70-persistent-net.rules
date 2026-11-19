@@ -1,0 +1,2 @@
+# Dedicated Internal Management Interface (VirtIO) pinned via static MAC
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="52:54:00:f9:ab:48", NAME="mgmt0"
